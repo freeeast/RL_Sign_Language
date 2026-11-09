@@ -1,7 +1,7 @@
 From 0fc92b7f2d54895fe1f9c0e2988013f3bf32e2f8 Mon Sep 17 00:00:00 2001
 From: Signbot AutoDL <zhengsw200304@gmail.com>
 Date: Mon, 9 Nov 2026 07:19:02 +0000
-Subject: [PATCH 3/5] Fix keybody generation; add headless gen_keybody.py;
+Subject: [PATCH 3/6] Fix keybody generation; add headless gen_keybody.py;
  vectorize _set_env_state
 
 - h1_view (H1MimicViewMotion) forced no_keybody=False, so MotionLib exit()ed

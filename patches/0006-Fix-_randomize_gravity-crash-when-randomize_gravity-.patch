@@ -1,0 +1,30 @@
+From 44624144d89757cf417e019498e3fc325e9a9645 Mon Sep 17 00:00:00 2001
+From: Signbot AutoDL <zhengsw200304@gmail.com>
+Date: Mon, 9 Nov 2026 10:05:43 +0000
+Subject: [PATCH 6/6] Fix _randomize_gravity crash when randomize_gravity=False
+
+external_force stayed None and 'None + Tensor' raised TypeError at the first
+gravity resample (step 500 = 10s). gen_keybody.py disables gravity
+randomization, so motions longer than 500 frames never got key body files.
+---
+ legged_gym/legged_gym/envs/h1/h1_mimic_hand.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/legged_gym/legged_gym/envs/h1/h1_mimic_hand.py b/legged_gym/legged_gym/envs/h1/h1_mimic_hand.py
+index 7a4ed96..a9b621d 100644
+--- a/legged_gym/legged_gym/envs/h1/h1_mimic_hand.py
++++ b/legged_gym/legged_gym/envs/h1/h1_mimic_hand.py
+@@ -454,7 +454,9 @@ class H1MimicHand(LeggedRobotHand):
+             min_gravity, max_gravity = self.cfg.domain_rand.gravity_range
+             external_force = torch.rand(3, dtype=torch.float, device=self.device,
+                                         requires_grad=False) * (max_gravity - min_gravity) + min_gravity
+-
++        if external_force is None:
++            # randomize_gravity=False: keep nominal gravity (upstream crashed with None + Tensor)
++            external_force = torch.zeros(3, dtype=torch.float, device=self.device)
+ 
+         sim_params = self.gym.get_sim_params(self.sim)
+         gravity = external_force + torch.Tensor([0, 0, -9.81]).to(self.device)
+-- 
+2.43.0
+

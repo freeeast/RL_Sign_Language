@@ -1,7 +1,7 @@
 From 7af7cbc6239ea8b4a9a0fcd7f04c2c43a60311da Mon Sep 17 00:00:00 2001
 From: Signbot AutoDL <zhengsw200304@gmail.com>
 Date: Mon, 9 Nov 2026 08:33:03 +0000
-Subject: [PATCH 5/5] Fix gen_keybody action size; vectorize per-step dof
+Subject: [PATCH 5/6] Fix gen_keybody action size; vectorize per-step dof
  loops; drop per-step prints; per-clip pose layout
 
 - gen_keybody.py stepped the env with env.num_actions (55) zeros, but the policy

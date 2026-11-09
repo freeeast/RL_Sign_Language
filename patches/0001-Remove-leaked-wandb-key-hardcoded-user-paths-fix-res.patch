@@ -1,7 +1,7 @@
 From 850b345510566a6d20daac92e80c3f19f5354f83 Mon Sep 17 00:00:00 2001
 From: Signbot AutoDL <zhengsw200304@gmail.com>
 Date: Mon, 9 Nov 2026 07:17:07 +0000
-Subject: [PATCH 1/5] Remove leaked wandb key, hardcoded user paths; fix resume
+Subject: [PATCH 1/6] Remove leaked wandb key, hardcoded user paths; fix resume
  std size and play.py defaults
 
 - train.py: drop the author's hardcoded WANDB_API_KEY; log offline unless the
