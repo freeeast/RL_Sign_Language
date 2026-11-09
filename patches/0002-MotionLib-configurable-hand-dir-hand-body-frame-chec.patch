@@ -1,0 +1,172 @@
+From e0ae0d8048c52b37e7635c5642fec2222b4e1510 Mon Sep 17 00:00:00 2001
+From: Signbot AutoDL <zhengsw200304@gmail.com>
+Date: Mon, 9 Nov 2026 07:17:42 +0000
+Subject: [PATCH 2/4] MotionLib: configurable hand dir, hand/body frame check,
+ lerp hand angles, fix pkl cache
+
+- hand poses were loaded from a hardcoded /data1/guanren/CSL-Daily path; now from
+  the yaml's top-level hand_root, $SIGNBOT_HAND_DIR, or <root>/../target_linker_hand.
+- assert hand and body clips have the same number of frames (they share offsets).
+- hand joint angles were interpolated with quaternion slerp on a 30-d vector; use lerp.
+- torch.cat on an empty list crashed when hand_flag=False.
+- pkl cache: create the pkl dir, detect a stale cache, and continue instead of exit()
+  after building it on the first run.
+---
+ ASE/ase/utils/motion_lib.py | 83 +++++++++++++++++++++++++++++--------
+ 1 file changed, 65 insertions(+), 18 deletions(-)
+
+diff --git a/ASE/ase/utils/motion_lib.py b/ASE/ase/utils/motion_lib.py
+index cf4a520..4335700 100644
+--- a/ASE/ase/utils/motion_lib.py
++++ b/ASE/ase/utils/motion_lib.py
+@@ -110,14 +110,24 @@ class MotionLib():
+         # pkl_file = '/data1/guanren/American_poses/target_body_pkl/'+yaml_name + ".pkl"
+         
+         if not no_keybody and not regen_pkl and ext == ".yaml" :
+-            try:
+-                self.deserialize_motions(pkl_file)
+-            except:
+-                print("No pkl file found, loading from yaml")
+-                print("Setting motion device: cpu")
++            loaded = False
++            if os.path.exists(pkl_file):
++                try:
++                    self.deserialize_motions(pkl_file)
++                    loaded = self._pkl_matches_yaml(motion_file)
++                    if not loaded:
++                        print(f"[MotionLib] {pkl_file} is stale (motion list differs from yaml), regenerating")
++                except Exception as e:
++                    print(f"[MotionLib] failed to load {pkl_file}: {e}")
++            if not loaded:
++                # Upstream built the cache on cpu and then called exit(), so the first
++                # run always terminated. Build on cpu, save, then reload on the target device.
++                print("No valid pkl file found, loading from yaml (on cpu)")
+                 self._device = "cpu"
+                 self._load_motions(motion_file, no_keybody)
+                 self.serialize_motions(pkl_file)
++                self._device = device
++                self.deserialize_motions(pkl_file)
+         else:
+             self._load_motions(motion_file, no_keybody)
+             if regen_pkl:
+@@ -141,16 +151,27 @@ class MotionLib():
+             # hand_angle = torch.tensor(hand_angle).float().to(self._device)
+             # self.hand_lrs = hand_angle
+ 
+-            for item in motion_names:
+-                # hand_file = os.path.abspath(os.path.join(motion_dir, "../hand", item+"_hand_full_pose.npy"))
+-                # hand_file = '/data1/guanren/American_poses/target_linker_hand/' + item + "_hand_full_pose.npy"
+-                hand_file = '/data1/guanren/CSL-Daily/target_linker_hand/' + item + "_hand_full_pose.npy"
++            # upstream hardcoded '/data1/guanren/CSL-Daily/target_linker_hand/'
++            hand_dir = self._resolve_hand_dir(motion_file)
++            print(f"[MotionLib] loading retargeted hand poses from {hand_dir}")
++            for i, item in enumerate(motion_names):
++                hand_file = os.path.join(hand_dir, item + "_hand_full_pose.npy")
++                if not os.path.exists(hand_file):
++                    raise FileNotFoundError(f"[MotionLib] missing hand file {hand_file}. "
++                                            "Run the hand retargeting step (retarget_hands.py) for this motion "
++                                            "or remove it from the yaml.")
+                 hand_angle = np.load(hand_file)
+-                hand_angle = torch.tensor(hand_angle).float().to(self._device)
++                hand_angle = torch.tensor(hand_angle).float().reshape(hand_angle.shape[0], -1).to(self._device)
++                n_body = int(self._motion_num_frames[i])
++                if hand_angle.shape[0] != n_body:
++                    # body and hand frames are concatenated and indexed with the same
++                    # offsets, a mismatch silently misaligns every following motion
++                    raise ValueError(f"[MotionLib] {item}: hand has {hand_angle.shape[0]} frames but body has {n_body}. "
++                                     "Body and hand must be produced from the same frame list.")
+                 self.hand_lrs.append(hand_angle)
+ 
+-        self.hand_lrs = torch.cat(self.hand_lrs, dim=0).float().to(self._device)
+-        self.hand_lrs = self.hand_lrs.reshape(-1, 30)
++            self.hand_lrs = torch.cat(self.hand_lrs, dim=0).float().to(self._device)
++            self.hand_lrs = self.hand_lrs.reshape(-1, 30)
+         self.gts = torch.cat([m.global_translation for m in motions], dim=0).float().to(self._device)
+         self.grs = torch.cat([m.global_rotation for m in motions], dim=0).float().to(self._device)
+         self.lrs = torch.cat([m.local_rotation for m in motions], dim=0).float().to(self._device)
+@@ -279,7 +300,10 @@ class MotionLib():
+         dof_pos = self._local_rotation_to_dof(local_rot)
+ 
+         if self._hand_flag:
+-            hand_dof_pos = torch_utils.slerp(hand_rot0, hand_rot1, blend)
++            # upstream used quaternion slerp on the 30-d joint-angle vector, which mostly
++            # degenerates to "take frame 0" (|dot| >= 1) and can flip signs; joint angles
++            # must be linearly interpolated.
++            hand_dof_pos = (1.0 - blend) * hand_rot0 + blend * hand_rot1
+ 
+             extra_wrist = torch.zeros(hand_dof_pos.shape[0], 4, device=self._device)
+ 
+@@ -436,10 +460,10 @@ class MotionLib():
+                    self._motions_local_key_body_pos, 
+                    self._motion_difficulty, 
+                    self.motion_description]
++        os.makedirs(os.path.dirname(pkl_file), exist_ok=True)
+         with open(pkl_file, 'wb') as outp:
+             pickle.dump(objects, outp, pickle.HIGHEST_PROTOCOL)
+         print("Saved to: ", pkl_file)
+-        exit()
+ 
+     def deserialize_motions(self, pkl_file):
+         with open(pkl_file, 'rb') as inp:
+@@ -457,7 +481,7 @@ class MotionLib():
+         self._motion_dt = objects[4].to(self._device)
+         self._motion_num_frames = objects[5].to(self._device)
+         self._motion_files = objects[6]
+-        self._motions_local_key_body_pos = objects[7]
++        self._motions_local_key_body_pos = [x.to(self._device) for x in objects[7]]
+         self._motion_difficulty = objects[8].to(self._device)
+         self.motion_description = objects[9]
+ 
+@@ -465,6 +489,29 @@ class MotionLib():
+         total_len = self.get_total_length()
+         print("Loaded {:d} motions with a total length of {:.3f}s.".format(num_motions, total_len))
+     
++    def _pkl_matches_yaml(self, motion_file):
++        motion_files = self._fetch_motion_files(motion_file)[0]
++        return [os.path.normpath(f) for f in motion_files] == [os.path.normpath(f) for f in self._motion_files]
++
++    def _resolve_hand_dir(self, motion_file):
++        """Where '<motion>_hand_full_pose.npy' files live. Priority:
++        1. top-level `hand_root` key in the motion yaml (relative paths are relative to the yaml)
++        2. env var SIGNBOT_HAND_DIR
++        3. <motions.root>/../target_linker_hand
++        """
++        if os.path.splitext(motion_file)[1] == ".yaml":
++            with open(motion_file, 'r') as f:
++                cfg = yaml.load(f, Loader=yaml.SafeLoader)
++            if cfg.get("hand_root"):
++                return os.path.normpath(os.path.join(os.path.dirname(motion_file), cfg["hand_root"]))
++            if os.environ.get("SIGNBOT_HAND_DIR"):
++                return os.environ["SIGNBOT_HAND_DIR"]
++            body_root = os.path.join(os.path.dirname(motion_file), cfg["motions"]["root"])
++            return os.path.normpath(os.path.join(body_root, "..", "target_linker_hand"))
++        if os.environ.get("SIGNBOT_HAND_DIR"):
++            return os.environ["SIGNBOT_HAND_DIR"]
++        return os.path.normpath(os.path.join(os.path.dirname(motion_file), "..", "target_linker_hand"))
++
+     def _fetch_motion_files(self, motion_file):
+         ext = os.path.splitext(motion_file)[1]
+         if (ext == ".yaml"):
+@@ -473,7 +520,7 @@ class MotionLib():
+             motion_difficulty = []
+             motion_description = []
+             motion_names = []
+-            with open(os.path.join(os.getcwd(), motion_file), 'r') as f:
++            with open(motion_file, 'r') as f:
+                 motion_config = yaml.load(f, Loader=yaml.SafeLoader)
+ 
+             dir_name = os.path.join(os.path.dirname(motion_file), motion_config['motions']["root"])
+@@ -485,8 +532,8 @@ class MotionLib():
+                     continue
+                 curr_file = motion_entry
+                 curr_weight = motion_config["motions"][motion_entry]['weight']
+-                curr_difficulty = motion_config["motions"][motion_entry]['difficulty']
+-                curr_description = motion_config["motions"][motion_entry]['description']
++                curr_difficulty = motion_config["motions"][motion_entry].get('difficulty', 1)
++                curr_description = motion_config["motions"][motion_entry].get('description', 'None')
+                 assert(curr_weight >= 0)
+                 motion_names.append(curr_file)
+                 curr_file = os.path.join(dir_name, curr_file + ".npy")
+-- 
+2.43.0
+

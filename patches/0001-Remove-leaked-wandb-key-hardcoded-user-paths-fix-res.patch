@@ -1,0 +1,173 @@
+From 850b345510566a6d20daac92e80c3f19f5354f83 Mon Sep 17 00:00:00 2001
+From: Signbot AutoDL <zhengsw200304@gmail.com>
+Date: Mon, 9 Nov 2026 07:17:07 +0000
+Subject: [PATCH 1/4] Remove leaked wandb key, hardcoded user paths; fix resume
+ std size and play.py defaults
+
+- train.py: drop the author's hardcoded WANDB_API_KEY; log offline unless the
+  user configured wandb; use absolute log dir; save the linker config.
+- helpers.py: no default wandb entity (was the author's account).
+- logger.py: hardcoded /home/guanren savefig path.
+- task_registry.py: reset_std used a hardcoded 21 actions -> --resume crashed
+  for the 55-action linker-hand policy.
+- play.py: num_envs was hardcoded to 884; logs resolved relative to cwd.
+- base_task.py: keep a graphics device in headless mode when recording video.
+---
+ legged_gym/legged_gym/envs/base/base_task.py |  5 ++++-
+ legged_gym/legged_gym/scripts/play.py        | 10 +++++-----
+ legged_gym/legged_gym/scripts/train.py       | 14 ++++++++++----
+ legged_gym/legged_gym/utils/helpers.py       |  2 +-
+ legged_gym/legged_gym/utils/logger.py        |  3 ++-
+ legged_gym/legged_gym/utils/task_registry.py |  2 +-
+ 6 files changed, 23 insertions(+), 13 deletions(-)
+
+diff --git a/legged_gym/legged_gym/envs/base/base_task.py b/legged_gym/legged_gym/envs/base/base_task.py
+index ce1b3a9..96a37a5 100644
+--- a/legged_gym/legged_gym/envs/base/base_task.py
++++ b/legged_gym/legged_gym/envs/base/base_task.py
+@@ -55,7 +55,10 @@ class BaseTask():
+ 
+         # graphics device for rendering, -1 for no rendering
+         self.graphics_device_id = self.sim_device_id
+-        if self.headless == True:
++        # keep a graphics device in headless mode when camera sensors are needed
++        # (e.g. `play.py --headless --record_video` on a server without display)
++        need_camera = getattr(cfg.env, "record_video", False) or getattr(cfg.env, "record_frame", False)
++        if self.headless == True and not need_camera:
+             self.graphics_device_id = -1
+ 
+         self.num_envs = cfg.env.num_envs
+diff --git a/legged_gym/legged_gym/scripts/play.py b/legged_gym/legged_gym/scripts/play.py
+index 42db2d3..5795d03 100644
+--- a/legged_gym/legged_gym/scripts/play.py
++++ b/legged_gym/legged_gym/scripts/play.py
+@@ -64,14 +64,14 @@ def play(args):
+     args.task = "h1_mimic_eval" if args.task == "h1_mimic" or args.task == "h1_mimic_amp" or args.task == "h1_mimic_hand" else args.task
+     faulthandler.enable()
+     exptid = args.exptid
+-    log_pth = "../../logs/{}/".format(args.proj_name) + args.exptid
++    log_pth = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", args.proj_name, args.exptid)
+ 
+     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
+     # override some parameters for testing
+     if args.nodelay:
+         env_cfg.domain_rand.action_delay_view = 0
+     env_cfg.motion.motion_curriculum = True
+-    env_cfg.env.num_envs = 884#2 if not args.num_envs else args.num_envs
++    env_cfg.env.num_envs = 2 if not args.num_envs else args.num_envs  # upstream hardcoded 884
+     env_cfg.env.episode_length_s = 30
+     env_cfg.commands.resampling_time = 60
+     env_cfg.terrain.num_rows = 5
+@@ -130,7 +130,7 @@ def play(args):
+ 
+     if args.task == "h1_mimic_merge":
+         # upper policy
+-        log_pth_upper = "../../logs/{}/".format(args.proj_name) + "070-20"
++        log_pth_upper = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", args.proj_name, "070-20")
+         log_pth_upper = get_load_path_auto(log_pth_upper, load_run=train_cfg.runner.load_run, checkpoint=train_cfg.runner.checkpoint)
+         log_pth_upper = os.path.dirname(log_pth_upper)
+         path = os.path.join(log_pth_upper, "traced")
+@@ -161,7 +161,7 @@ def play(args):
+             motion_description = env._motion_lib.get_motion_description(env._motion_ids[i])
+             video_name = motion_id + "-" + motion_description +".mp4"
+             run_name = log_pth.split("/")[-1]
+-            path = f"../../logs/videos_retarget/{run_name}"
++            path = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", "videos_retarget", run_name)
+             if not os.path.exists(path):
+                 os.makedirs(path)
+             video_name = os.path.join(path, video_name)
+@@ -176,7 +176,7 @@ def play(args):
+             motion_description = env._motion_lib.get_motion_description(env._motion_ids[i])
+             frame_name = motion_id + "-" + motion_description
+             run_name = log_pth.split("/")[-1]
+-            path = f"../../logs/videos_retarget/debug-{env.cfg.motion.motion_name}/{frame_name}"
++            path = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", "videos_retarget", f"debug-{env.cfg.motion.motion_name}", frame_name)
+             if not os.path.exists(path):
+                 os.makedirs(path)
+             paths.append(path)
+diff --git a/legged_gym/legged_gym/scripts/train.py b/legged_gym/legged_gym/scripts/train.py
+index 0104ad9..3538875 100644
+--- a/legged_gym/legged_gym/scripts/train.py
++++ b/legged_gym/legged_gym/scripts/train.py
+@@ -30,6 +30,8 @@
+ 
+ import numpy as np
+ import os
++# NOTE: the upstream repo hardcoded the author's WANDB_API_KEY here. Removed.
++# Use `wandb login` or export WANDB_API_KEY yourself if you want online logging.
+ from datetime import datetime
+ 
+ import isaacgym
+@@ -52,14 +54,18 @@ def train(args):
+         args.cols = 5
+         args.num_envs = 64
+     else:
+-        mode = "online"
+-    
++        # online only if the user configured wandb, otherwise log offline
++        # (run `wandb sync <dir>` later to upload)
++        mode = os.environ.get("WANDB_MODE") or ("online" if os.environ.get("WANDB_API_KEY") else "offline")
++
+     if args.no_wandb:
+         mode = "disabled"
+-    wandb.init(project=args.proj_name, name=args.exptid, entity=args.entity, mode=mode, dir="../../logs")
++    wandb_dir = os.path.join(LEGGED_GYM_ROOT_DIR, "logs")
++    os.makedirs(wandb_dir, exist_ok=True)
++    wandb.init(project=args.proj_name, name=args.exptid, entity=args.entity, mode=mode, dir=wandb_dir)
+     wandb.save(LEGGED_GYM_ENVS_DIR + "/base/legged_robot_config.py", policy="now")
+     wandb.save(LEGGED_GYM_ENVS_DIR + "/base/legged_robot_hand.py", policy="now")
+-    wandb.save(LEGGED_GYM_ENVS_DIR + "/h1/h1_mimic_hand_config.py", policy="now")
++    wandb.save(LEGGED_GYM_ENVS_DIR + "/h1/h1_mimic_linker_config.py", policy="now")
+     wandb.save(LEGGED_GYM_ENVS_DIR + "/h1/h1_mimic_hand.py", policy="now")
+ 
+     env, env_cfg = task_registry.make_env(name=args.task, args=args)
+diff --git a/legged_gym/legged_gym/utils/helpers.py b/legged_gym/legged_gym/utils/helpers.py
+index f204e25..2245a60 100644
+--- a/legged_gym/legged_gym/utils/helpers.py
++++ b/legged_gym/legged_gym/utils/helpers.py
+@@ -217,7 +217,7 @@ def get_args():
+         
+         {"name": "--teacher", "type": str, "help": "Name of the teacher policy to use when distilling"},
+         {"name": "exptid", "type": str, "help": "exptid"},
+-        {"name": "--entity", "type": str, "default": "guanrenqiao", "help": "wandb entity"},
++        {"name": "--entity", "type": str, "default": None, "help": "wandb entity (default: your own wandb account)"},
+         {"name": "--resumeid", "type": str, "help": "exptid"},
+         {"name": "--daggerid", "type": str, "help": "name of dagger run"},
+         {"name": "--use_camera", "action": "store_true", "default": False, "help": "render camera for distillation"},
+diff --git a/legged_gym/legged_gym/utils/logger.py b/legged_gym/legged_gym/utils/logger.py
+index ad186fc..60e7510 100644
+--- a/legged_gym/legged_gym/utils/logger.py
++++ b/legged_gym/legged_gym/utils/logger.py
+@@ -28,6 +28,7 @@
+ #
+ # Copyright (c) 2021 ETH Zurich, Nikita Rudin
+ 
++import os
+ import matplotlib.pyplot as plt
+ import numpy as np
+ from collections import defaultdict
+@@ -101,7 +102,7 @@ class Logger:
+         a.set(xlabel='time [s]', ylabel='Position [rad]', title='DOF Position')
+         a.legend()
+         
+-        plt.savefig('/home/guanren/expressive-humanoid/test.png')
++        plt.savefig(os.path.join(os.getcwd(), 'test.png'))
+ 
+     def print_rewards(self):
+         print("Average rewards per second:")
+diff --git a/legged_gym/legged_gym/utils/task_registry.py b/legged_gym/legged_gym/utils/task_registry.py
+index 84b03ea..816d1bf 100644
+--- a/legged_gym/legged_gym/utils/task_registry.py
++++ b/legged_gym/legged_gym/utils/task_registry.py
+@@ -164,7 +164,7 @@ class TaskRegistry():
+             resume_path = get_load_path(log_root, load_run=train_cfg.runner.load_run, checkpoint=train_cfg.runner.checkpoint)
+             runner.load(resume_path)
+             if not train_cfg.policy.continue_from_last_std:
+-                runner.alg.actor_critic.reset_std(train_cfg.policy.init_noise_std, 21, device=runner.device)
++                runner.alg.actor_critic.reset_std(train_cfg.policy.init_noise_std, runner.alg.actor_critic.std.numel(), device=runner.device)
+ 
+         if "return_log_dir" in kwargs:
+             return runner, train_cfg, os.path.dirname(resume_path)
+-- 
+2.43.0
+

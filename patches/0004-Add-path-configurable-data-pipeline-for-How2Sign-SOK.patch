@@ -1,0 +1,674 @@
+From 2977d14ce19d5ba71742f32084570b207de5148e Mon Sep 17 00:00:00 2001
+From: Signbot AutoDL <zhengsw200304@gmail.com>
+Date: Mon, 9 Nov 2026 07:22:48 +0000
+Subject: [PATCH 4/4] Add path-configurable data pipeline for How2Sign/SOKE
+ SMPL-X poses
+
+tools/prepare_smplx_poses.py   SMPL-X pkl -> source_body/*.npy + hand_joints/*.npz
+tools/generate_motion_yaml.py  index.csv -> motion yaml (absolute root + hand_root)
+tools/retarget_hands.py        hand joints -> Linker hand angles (dex-retargeting env)
+retarget_motion_h1_smpl.py     argparse, bounded worker count, per-clip error handling
+
+Fixes vs upstream data_process_body.py / data_process_hand.py:
+- How2Sign frames (<clip>_<i>_3D.pkl) were sorted lexicographically -> scrambled.
+- lower-body template S000003_P0000_T00.npy is not in the repo; use a canonical
+  upright template (or --template).
+- SMPL-X model built once and run batched instead of per frame per clip.
+- body and hand come from one forward pass, so frame counts always match.
+Default training motion yaml -> motions_how2sign_val.yaml.
+---
+ ASE/ase/poselib/retarget_motion_h1_smpl.py    |  59 ++--
+ .../envs/h1/h1_mimic_linker_config.py         |   3 +-
+ tools/generate_motion_yaml.py                 |  73 +++++
+ tools/prepare_smplx_poses.py                  | 305 ++++++++++++++++++
+ tools/retarget_hands.py                       | 141 ++++++++
+ 5 files changed, 562 insertions(+), 19 deletions(-)
+ create mode 100644 tools/generate_motion_yaml.py
+ create mode 100644 tools/prepare_smplx_poses.py
+ create mode 100644 tools/retarget_hands.py
+
+diff --git a/ASE/ase/poselib/retarget_motion_h1_smpl.py b/ASE/ase/poselib/retarget_motion_h1_smpl.py
+index 2bdef65..e9ba406 100644
+--- a/ASE/ase/poselib/retarget_motion_h1_smpl.py
++++ b/ASE/ase/poselib/retarget_motion_h1_smpl.py
+@@ -31,6 +31,7 @@ import torch
+ import json
+ import numpy as np
+ import os, yaml
++_HERE = os.path.dirname(os.path.abspath(__file__))
+ from tqdm import tqdm
+ import multiprocessing
+ 
+@@ -282,38 +283,60 @@ def process(i, motion_name, source_tpose, target_tpose, source_motion, target_mo
+     if VISUALIZE:
+         plot_skeleton_motion_interactive(target_motion)
+ 
++def _process_star(job):
++    try:
++        return process(*job)
++    except Exception as e:  # do not kill the whole pool for one bad clip
++        print(f"failed to retarget {job[1]}: {type(e).__name__}: {e}")
++
++
+ def main():
+-    # load retarget config
+-    retarget_data_path = "data/configs/retarget_smpl_to_h1.json"
+-    with open(retarget_data_path) as f:
+-        retarget_data = json.load(f)
++    # Upstream hardcoded /data1/guanren/... (in the json) and test_American_sign_language.yaml,
++    # and used multiprocessing.cpu_count() workers, which inside a container (AutoDL)
++    # is the *host* core count -> dozens of processes each importing torch + isaacgym.
++    import argparse
++    ap = argparse.ArgumentParser(description="Retarget SMPL source motions to H1 (body only)")
++    ap.add_argument("--yaml", required=True, help="motion yaml (path, or file name inside data/configs)")
++    ap.add_argument("--source_dir", required=True, help="dir of source_body/<clip>.npy (prepare_smplx_poses.py)")
++    ap.add_argument("--target_dir", default=None, help="output dir; default: the yaml's motions.root")
++    ap.add_argument("--workers", type=int, default=min(8, len(os.sched_getaffinity(0))))
++    ap.add_argument("--config", default="data/configs/retarget_smpl_to_h1.json")
++    args = ap.parse_args()
+ 
++    yaml_path = args.yaml if os.path.exists(args.yaml) else os.path.join(_HERE, "data/configs", args.yaml)
++    yaml_path = os.path.abspath(yaml_path)
++    os.chdir(_HERE)  # tpose paths in the json are relative to this directory
++
++    with open(args.config) as f:
++        retarget_data = json.load(f)
+     source_tpose = SkeletonState.from_file(retarget_data["source_tpose"])
+     target_tpose = SkeletonState.from_file(retarget_data["target_tpose"])
+-    source_motion = retarget_data["source_motion"]
+-    target_motion = retarget_data["target_motion_path"]
+ 
+-    with open("data/configs/test_American_sign_language.yaml", 'r') as f:
++    with open(yaml_path, 'r') as f:
+         motions_list = yaml.load(f, Loader=yaml.SafeLoader)["motions"]
+-    all_motion_names =[]
++    source_motion = os.path.abspath(args.source_dir)
++    target_motion = args.target_dir or os.path.join(os.path.dirname(yaml_path), motions_list["root"])
++    target_motion = os.path.abspath(target_motion)
++    os.makedirs(target_motion, exist_ok=True)
++    print(f"source: {source_motion}\ntarget: {target_motion}")
++
++    all_motion_names = []
+     for motion_entry in motions_list.keys():
+         if motion_entry == "root":
+             continue
+-        target_motion_file = os.path.join(target_motion, motion_entry + ".npy")
+-        if os.path.exists(target_motion_file):
+-            print("Already exists, skip: ", motion_entry)
++        if os.path.exists(os.path.join(target_motion, motion_entry + ".npy")):
+             continue
+         all_motion_names.append(motion_entry)
+     all_motion_names.sort()
+-    print(len(all_motion_names))
+-    # Number of processes
+-    n_workers = multiprocessing.cpu_count()
++    print(f"{len(all_motion_names)} motions to retarget with {args.workers} workers")
+ 
+-    # Create a pool of worker processes
+-    with multiprocessing.Pool(n_workers) as pool:
+-        # Using starmap to pass multiple arguments to the process_file function
+-        list(tqdm(pool.starmap(process, [(i, motion_name, source_tpose, target_tpose, source_motion, target_motion, retarget_data) for i, motion_name in enumerate(all_motion_names)]), total=len(all_motion_names)))
++    jobs = [(i, m, source_tpose, target_tpose, source_motion, target_motion, retarget_data)
++            for i, m in enumerate(all_motion_names)]
++    with multiprocessing.Pool(args.workers, initializer=torch.set_num_threads, initargs=(1,)) as pool:
++        list(tqdm(pool.imap_unordered(_process_star, jobs), total=len(jobs)))
+ 
++    missing = [m for m in all_motion_names if not os.path.exists(os.path.join(target_motion, m + ".npy"))]
++    print(f"done, {len(all_motion_names) - len(missing)} ok, {len(missing)} failed")
+     return
+ 
+ if __name__ == '__main__':
+diff --git a/legged_gym/legged_gym/envs/h1/h1_mimic_linker_config.py b/legged_gym/legged_gym/envs/h1/h1_mimic_linker_config.py
+index 113ea8f..a948f65 100644
+--- a/legged_gym/legged_gym/envs/h1/h1_mimic_linker_config.py
++++ b/legged_gym/legged_gym/envs/h1/h1_mimic_linker_config.py
+@@ -66,7 +66,8 @@ class H1MimicHandCfg( LeggedRobotCfg ):
+         hand_flag = True
+         motion_type = "yaml"
+         # motion_name = "motions_autogen_all_no_run_jump.yaml"
+-        motion_name = 'motions_chinese_sign_language.yaml'
++        # motion_name = 'motions_chinese_sign_language.yaml'
++        motion_name = 'motions_how2sign_val.yaml'  # written by tools/generate_motion_yaml.py
+ 
+         global_keybody = False
+         global_keybody_reset_time = 2
+diff --git a/tools/generate_motion_yaml.py b/tools/generate_motion_yaml.py
+new file mode 100644
+index 0000000..ea208b4
+--- /dev/null
++++ b/tools/generate_motion_yaml.py
+@@ -0,0 +1,73 @@
++"""Step 2 of the data pipeline: write the motion yaml used by retargeting and training.
++
++Replaces upstream `generate_yaml.py` (hardcoded /data1 and /home paths).
++Reads <data_root>/index.csv written by prepare_smplx_poses.py and writes
++ASE/ase/poselib/data/configs/<name>.yaml with absolute `root` (retargeted body
++npy dir) and top-level `hand_root` (retargeted hand dir, read by MotionLib).
++
++Example:
++  python tools/generate_motion_yaml.py --data_root /root/autodl-tmp/data/how2sign \
++      --name motions_how2sign_val --min_frames 30
++  python tools/generate_motion_yaml.py --data_root /root/autodl-tmp/data/how2sign \
++      --name motions_how2sign_debug --limit 16
++"""
++import argparse
++import csv
++import os
++import random
++
++import yaml
++
++SIGNBOT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++CONFIG_DIR = os.path.join(SIGNBOT_ROOT, "ASE", "ase", "poselib", "data", "configs")
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--data_root", required=True)
++    ap.add_argument("--name", required=True, help="yaml file name without extension")
++    ap.add_argument("--body_dir", default=None, help="default: <data_root>/target_body")
++    ap.add_argument("--hand_dir", default=None, help="default: <data_root>/target_linker_hand")
++    ap.add_argument("--min_frames", type=int, default=10)
++    ap.add_argument("--max_frames", type=int, default=0, help="0 = no limit")
++    ap.add_argument("--limit", type=int, default=0, help="keep at most N clips (random subset with --seed)")
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--description", default="American Sign Language")
++    ap.add_argument("--difficulty", type=int, default=4)
++    ap.add_argument("--require_done", action="store_true",
++                    help="only keep clips whose retargeted body AND hand files already exist")
++    args = ap.parse_args()
++
++    body_dir = os.path.abspath(args.body_dir or os.path.join(args.data_root, "target_body"))
++    hand_dir = os.path.abspath(args.hand_dir or os.path.join(args.data_root, "target_linker_hand"))
++
++    clips = []
++    with open(os.path.join(args.data_root, "index.csv")) as f:
++        for row in csv.DictReader(f):
++            n = int(row["num_frames"])
++            if n < args.min_frames or (args.max_frames and n > args.max_frames):
++                continue
++            c = row["clip"]
++            if args.require_done and not (os.path.exists(os.path.join(body_dir, c + ".npy"))
++                                          and os.path.exists(os.path.join(hand_dir, c + "_hand_full_pose.npy"))):
++                continue
++            clips.append(c)
++    clips.sort()
++    if args.limit and len(clips) > args.limit:
++        random.Random(args.seed).shuffle(clips)
++        clips = sorted(clips[:args.limit])
++
++    motions = {"root": body_dir + "/"}
++    for c in clips:
++        motions[c] = {"description": args.description, "difficulty": args.difficulty,
++                      "trim_beg": -1, "trim_end": -1, "weight": 1.0}
++    os.makedirs(CONFIG_DIR, exist_ok=True)
++    out = os.path.join(CONFIG_DIR, args.name + ".yaml")
++    with open(out, "w") as f:
++        yaml.safe_dump({"motions": motions, "hand_root": hand_dir + "/"}, f,
++                       default_flow_style=False, allow_unicode=True, sort_keys=False)
++    print(f"wrote {len(clips)} motions to {out}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/prepare_smplx_poses.py b/tools/prepare_smplx_poses.py
+new file mode 100644
+index 0000000..a9f6fca
+--- /dev/null
++++ b/tools/prepare_smplx_poses.py
+@@ -0,0 +1,305 @@
++"""Step 1 of the data pipeline: per-frame SMPL-X pkl  ->  Signbot source motions.
++
++Replaces upstream `data_process_body.py` and the SMPL-X half of
++`dex-retargeting/example/data_process_hand.py` (same math, see notes), and
++runs in the *signbot* conda env (needs torch + smplx, NOT dex_retargeting).
++
++For every clip directory (a directory that directly contains *.pkl frames):
++  <out_root>/source_body/<clip>.npy   SkeletonMotion dict (14 joints), input of
++                                      ASE/ase/poselib/retarget_motion_h1_smpl.py
++  <out_root>/hand_joints/<clip>.npz   left/right 21x3 hand joints (wrist frame),
++                                      input of tools/retarget_hands.py
++  <out_root>/index.csv                clip,num_frames  (used by generate_motion_yaml.py)
++
++Body and hand outputs come from the same SMPL-X forward pass on the same frame
++list, so their frame counts always match (MotionLib asserts this).
++
++Fixes compared to upstream:
++  * How2Sign frames are named `<clip>_<i>_3D.pkl` (not zero padded). Upstream
++    used sorted(os.listdir()) -> 0,1,10,100,101,...,11 : frames were scrambled.
++    Frames are now sorted by their numeric index.
++  * Upstream overwrote the lower body with frame 0 of
++    ASE/ase/poselib/data/npy/S000003_P0000_T00.npy, a CSL-Daily file that is not
++    in the repository. By default a canonical template is used instead
++    (identity rotations for pelvis/legs/spine3 == upright, facing forward, straight
++    legs; zero root translation, which retargeting rescales and re-grounds anyway).
++    Pass --template <processed .npy> to use a specific clip as the template.
++  * SMPL-X model created once, forward pass batched per clip on GPU (upstream
++    re-created the model for every clip and ran one frame at a time).
++  * paths are CLI arguments; `cam_trans` is optional.
++
++Example:
++  python tools/prepare_smplx_poses.py \
++      --pose_root /root/autodl-tmp/data/raw_poses \
++      --smplx_dir /root/autodl-tmp/Signbot/body_models \
++      --out_root  /root/autodl-tmp/data/how2sign
++"""
++import argparse
++import csv
++import os
++import pickle
++import re
++import sys
++from collections import OrderedDict
++
++import numpy as np
++from scipy.spatial.transform import Rotation as R
++
++FULL_BODY = 22
++BODY_KEYPOINT = 14
++PARENT_INDICES = [-1, 0, 0, 1, 2, 3, 4, 0, 7, 7, 8, 9, 10, 11]
++# SMPL-X joint ids of the 14 Signbot joints (see NODE_NAMES)
++KEY_POINT_INDICES = [0, 1, 2, 4, 5, 7, 8, 9, 16, 17, 18, 19, 20, 21]
++NODE_NAMES = ['Pelvis', 'L_Hip', 'R_Hip', 'L_Knee', 'R_Knee', 'L_Ankle', 'R_Ankle',
++              'Spine3', 'L_Shoulder', 'R_Shoulder', 'L_Elbow', 'R_Elbow', 'L_Wrist', 'R_Wrist']
++STATIC_JOINTS = [0, 1, 2, 3, 4, 5, 6, 7]  # pelvis, legs, spine3 are frozen (signing is upper body)
++
++# hand joints in panoptic/mediapipe order (same as upstream data_process_hand.py)
++SMPLX_HAND_TO_PANOPTIC = [0, 13, 14, 15, 16, 1, 2, 3, 17, 4, 5, 6, 18, 10, 11, 12, 19, 7, 8, 9, 20]
++RIGHT_HAND_IDXS = [21] + list(range(40, 55)) + list(range(71, 76))
++LEFT_HAND_IDXS = [20] + list(range(25, 40)) + list(range(66, 71))
++
++
++# ----------------------------------------------------------------------------- io
++def frame_index(fname, clip):
++    """Numeric frame index of a frame file name.
++    How2Sign:  <clip>_<i>_3D.pkl     CSL-Daily: 000123.pkl / images0123.pkl"""
++    stem = os.path.splitext(fname)[0]
++    if stem.startswith(clip + "_"):
++        stem = stem[len(clip) + 1:]
++    stem = re.sub(r"_?3D$", "", stem)
++    nums = re.findall(r"\d+", stem)
++    if not nums:
++        raise ValueError(f"cannot parse frame index from {fname}")
++    return int(nums[-1])
++
++
++def find_clip_dirs(pose_root):
++    clips = []
++    for dirpath, _, filenames in os.walk(pose_root, followlinks=True):
++        if any(f.endswith(".pkl") for f in filenames):
++            clips.append(dirpath)
++    return sorted(clips)
++
++
++def _vec(data, key, n, required=True):
++    if key not in data:
++        if required:
++            raise KeyError(key)
++        return np.zeros(n, dtype=np.float32)
++    v = np.asarray(data[key], dtype=np.float32).reshape(-1)
++    if v.shape[0] < n:
++        raise ValueError(f"{key} has {v.shape[0]} values, expected {n}")
++    return v[:n]
++
++
++def load_clip(clip_dir):
++    clip = os.path.basename(os.path.normpath(clip_dir))
++    files = [f for f in os.listdir(clip_dir) if f.endswith(".pkl")]
++    files.sort(key=lambda f: frame_index(f, clip))
++    idx = [frame_index(f, clip) for f in files]
++    gaps = int(np.sum(np.diff(idx) != 1)) if len(idx) > 1 else 0
++    out = {k: [] for k in ("root", "body", "lhand", "rhand", "transl", "betas")}
++    for f in files:
++        with open(os.path.join(clip_dir, f), "rb") as fh:
++            d = pickle.load(fh)
++        out["root"].append(_vec(d, "smplx_root_pose", 3))
++        out["body"].append(_vec(d, "smplx_body_pose", 63))
++        out["lhand"].append(_vec(d, "smplx_lhand_pose", 45))
++        out["rhand"].append(_vec(d, "smplx_rhand_pose", 45))
++        out["transl"].append(_vec(d, "cam_trans", 3, required=False))
++        out["betas"].append(_vec(d, "smplx_shape", 10))
++    return clip, {k: np.stack(v) for k, v in out.items()}, gaps
++
++
++# ----------------------------------------------------------------------- smplx
++def preprocess_params(p):
++    """Exactly the upstream manipulation: freeze root/transl/lower spine to the last
++    frame and flip the global orientation from camera (y-down) to y-up."""
++    T = p["body"].shape[0]
++    transl = np.repeat(p["transl"][-1:], T, axis=0)
++    global_orient = np.repeat(p["root"][-1:], T, axis=0)
++    body = p["body"].reshape(T, 21, 3).copy()
++    body[:, :9] = body[-1, :9]
++    global_orient = (R.from_euler("x", 180, degrees=True) * R.from_rotvec(global_orient)).as_rotvec()
++    return transl, global_orient, body
++
++
++def smplx_joints(model, device, betas, global_orient, body, lhand, rhand, transl, chunk=512):
++    import torch
++    T = body.shape[0]
++    outs = []
++    for s in range(0, T, chunk):
++        e = min(T, s + chunk)
++        n = e - s
++
++        def t(x):
++            return torch.as_tensor(np.ascontiguousarray(x[s:e]), dtype=torch.float32, device=device).reshape(n, -1)
++
++        z3 = torch.zeros(n, 3, device=device)
++        with torch.no_grad():
++            o = model(betas=t(betas), global_orient=t(global_orient), body_pose=t(body),
++                      left_hand_pose=t(lhand), right_hand_pose=t(rhand), transl=t(transl),
++                      jaw_pose=z3, leye_pose=z3, reye_pose=z3,
++                      expression=torch.zeros(n, getattr(model, "num_expression_coeffs", 10), device=device),
++                      return_verts=False)
++        outs.append(o.joints.detach().cpu().numpy())
++    return np.concatenate(outs, 0)
++
++
++# ------------------------------------------------------------------ conversion
++def canonical_template():
++    rot = np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (BODY_KEYPOINT, 1))
++    return {"rotation": rot, "root_translation": np.zeros(3, dtype=np.float32), "local_translation": None}
++
++
++def load_template(path):
++    d = OrderedDict(np.load(path, allow_pickle=True).item())
++    return {"rotation": np.asarray(d["rotation"]["arr"])[0],
++            "root_translation": np.asarray(d["root_translation"]["arr"])[0],
++            "local_translation": np.asarray(d["skeleton_tree"]["local_translation"]["arr"])}
++
++
++def build_motion(joints, transl, global_orient, body, fps, template):
++    T = joints.shape[0]
++    dt = 1.0 / fps
++    gpos = joints[:, :FULL_BODY]
++
++    lin_vel = np.diff(gpos, axis=0) / dt
++    lin_vel = np.concatenate([np.zeros((1, FULL_BODY, 3)), lin_vel], 0)[:, KEY_POINT_INDICES]
++
++    all_pose = np.concatenate([global_orient[:, None], body], axis=1)  # T,22,3
++    quat = R.from_rotvec(all_pose.reshape(-1, 3)).as_quat().reshape(T, FULL_BODY, 4)[:, KEY_POINT_INDICES]
++
++    if T > 1:  # (q2 * q1^-1).as_rotvec() / dt, vectorized
++        q1 = R.from_quat(quat[:-1].reshape(-1, 4))
++        q2 = R.from_quat(quat[1:].reshape(-1, 4))
++        ang = ((q2 * q1.inv()).as_rotvec() / dt).reshape(T - 1, BODY_KEYPOINT, 3)
++        ang_vel = np.concatenate([np.zeros((1, BODY_KEYPOINT, 3)), ang], 0)
++    else:
++        ang_vel = np.zeros((1, BODY_KEYPOINT, 3))
++
++    kp = gpos[:, KEY_POINT_INDICES]
++    local_pos = np.zeros_like(kp)
++    for j, pj in enumerate(PARENT_INDICES):
++        local_pos[:, j] = transl if pj == -1 else kp[:, j] - kp[:, pj]
++
++    rotation = quat.astype(np.float32)
++    rotation[:, STATIC_JOINTS] = template["rotation"][STATIC_JOINTS]
++    root_translation = np.repeat(template["root_translation"][None].astype(np.float32), T, axis=0)
++    local_translation = local_pos[0].astype(np.float32)
++    if template["local_translation"] is not None:
++        local_translation[STATIC_JOINTS] = template["local_translation"][STATIC_JOINTS]
++    else:
++        local_translation[0] = 0.0
++
++    return OrderedDict([
++        ('rotation', {'arr': rotation, 'context': {'dtype': 'float32'}}),
++        ('root_translation', {'arr': root_translation, 'context': {'dtype': 'float32'}}),
++        ('global_velocity', {'arr': lin_vel.astype(np.float32), 'context': {'dtype': 'float32'}}),
++        ('global_angular_velocity', {'arr': ang_vel.astype(np.float32), 'context': {'dtype': 'float32'}}),
++        ('skeleton_tree', OrderedDict([
++            ('node_names', list(NODE_NAMES)),
++            ('parent_indices', {'arr': np.array(PARENT_INDICES), 'context': {'dtype': 'int64'}}),
++            ('local_translation', {'arr': local_translation, 'context': {'dtype': 'float32'}}),
++        ])),
++        ('is_local', True),
++        ('fps', fps),
++        ('__name__', 'SkeletonMotion'),
++    ])
++
++
++def hand_joints(joints):
++    """21x3 hand joints relative to the wrist, panoptic order (upstream math)."""
++    left = joints[:, LEFT_HAND_IDXS][:, SMPLX_HAND_TO_PANOPTIC] - joints[:, 20:21]
++    right = joints[:, RIGHT_HAND_IDXS][:, SMPLX_HAND_TO_PANOPTIC] - joints[:, 21:22]
++    left = left - left[:, 0:1]
++    right = right - right[:, 0:1]
++    return left.astype(np.float32), right.astype(np.float32)
++
++
++# ------------------------------------------------------------------------ main
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--pose_root", required=True, help="dir that contains one sub-dir of *.pkl frames per clip (searched recursively)")
++    ap.add_argument("--smplx_dir", required=True, help="dir containing smplx/SMPLX_NEUTRAL.npz (smplx.create model_path)")
++    ap.add_argument("--out_root", required=True)
++    ap.add_argument("--fps", type=float, default=30.0, help="fps written into the motion (upstream: 30)")
++    ap.add_argument("--min_frames", type=int, default=10, help="skip clips shorter than this (upstream: 10)")
++    ap.add_argument("--template", default=None, help="optional processed source_body .npy used for the frozen lower body")
++    ap.add_argument("--device", default="cuda")
++    ap.add_argument("--limit", type=int, default=0, help="only process the first N clips (debug)")
++    ap.add_argument("--overwrite", action="store_true")
++    args = ap.parse_args()
++
++    import torch
++    import smplx
++
++    body_dir = os.path.join(args.out_root, "source_body")
++    hand_dir = os.path.join(args.out_root, "hand_joints")
++    os.makedirs(body_dir, exist_ok=True)
++    os.makedirs(hand_dir, exist_ok=True)
++
++    device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
++    model = smplx.create(args.smplx_dir, "smplx", gender="neutral", num_betas=10, use_face_contour=True,
++                         flat_hand_mean=False, use_pca=False, batch_size=1).to(device)
++    template = load_template(args.template) if args.template else canonical_template()
++
++    clip_dirs = find_clip_dirs(args.pose_root)
++    if args.limit > 0:
++        clip_dirs = clip_dirs[:args.limit]
++    print(f"found {len(clip_dirs)} clip dirs under {args.pose_root}")
++    if not clip_dirs:
++        sys.exit("no *.pkl found, check --pose_root")
++
++    index_path = os.path.join(args.out_root, "index.csv")
++    index = {}
++    if os.path.exists(index_path):
++        with open(index_path) as f:
++            for row in csv.DictReader(f):
++                index[row["clip"]] = int(row["num_frames"])
++
++    try:
++        from tqdm import tqdm
++    except ImportError:
++        def tqdm(x, **k):
++            return x
++
++    n_ok = n_skip = n_fail = 0
++    for clip_dir in tqdm(clip_dirs, desc="smplx"):
++        clip = os.path.basename(os.path.normpath(clip_dir))
++        body_file = os.path.join(body_dir, clip + ".npy")
++        hand_file = os.path.join(hand_dir, clip + ".npz")
++        if not args.overwrite and os.path.exists(body_file) and os.path.exists(hand_file) and clip in index:
++            n_skip += 1
++            continue
++        try:
++            clip, p, gaps = load_clip(clip_dir)
++            T = p["body"].shape[0]
++            if T < args.min_frames:
++                n_skip += 1
++                continue
++            if gaps:
++                print(f"[warn] {clip}: {gaps} gaps in frame numbering")
++            transl, global_orient, body = preprocess_params(p)
++            joints = smplx_joints(model, device, p["betas"], global_orient, body, p["lhand"], p["rhand"], transl)
++            motion = build_motion(joints, transl, global_orient, body, args.fps, template)
++            left, right = hand_joints(joints)
++            np.save(body_file, motion)
++            np.savez(hand_file, left=left, right=right)
++            index[clip] = T
++            n_ok += 1
++        except Exception as e:  # keep going, report at the end
++            n_fail += 1
++            print(f"[error] {clip_dir}: {type(e).__name__}: {e}")
++
++    with open(index_path, "w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["clip", "num_frames"])
++        for k in sorted(index):
++            w.writerow([k, index[k]])
++    print(f"done: {n_ok} processed, {n_skip} skipped, {n_fail} failed. index: {index_path}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/retarget_hands.py b/tools/retarget_hands.py
+new file mode 100644
+index 0000000..5119fd4
+--- /dev/null
++++ b/tools/retarget_hands.py
+@@ -0,0 +1,141 @@
++"""Step 3b of the data pipeline: human hand joints -> Linker hand joint angles.
++
++Replaces the dex-retargeting half of upstream
++`dex-retargeting/example/data_process_hand.py` (same vector retargeting, same
++hand alignment). Run it in the separate *dexret* conda env (dex_retargeting +
++pinocchio + nlopt; no smplx / isaacgym needed).
++
++Input : <in_root>/hand_joints/<clip>.npz            (tools/prepare_smplx_poses.py)
++Output: <out_dir>/<clip>_hand_full_pose.npy          (T, 30) = [left 15 | right 15]
++
++Example:
++  python tools/retarget_hands.py --in_root /root/autodl-tmp/data/how2sign \
++      --out_dir /root/autodl-tmp/data/how2sign/target_linker_hand \
++      --urdf_dir /root/autodl-tmp/Signbot/body_models/hands --workers 8
++"""
++import argparse
++import multiprocessing as mp
++import os
++import sys
++
++import numpy as np
++
++
++# ---- alignment helpers, copied from upstream data_process_hand.py ----------
++def normalize(v):
++    return v / np.linalg.norm(v)
++
++
++def calculate_rotation_matrix_to_target(source_vector, target_vector):
++    source_vector = normalize(source_vector)
++    target_vector = normalize(target_vector)
++    cross_prod = np.cross(source_vector, target_vector)
++    dot_prod = np.dot(source_vector, target_vector)
++    if np.linalg.norm(cross_prod) < 1e-6:
++        return np.eye(3)
++    k = np.array([[0, -cross_prod[2], cross_prod[1]],
++                  [cross_prod[2], 0, -cross_prod[0]],
++                  [-cross_prod[1], cross_prod[0], 0]])
++    return np.eye(3) + k + k @ k * ((1 - dot_prod) / (np.linalg.norm(cross_prod) ** 2))
++
++
++def align_09_to_z_axis(global_coords):
++    """Rotate so that wrist(0)->middle MCP(9) points along +z."""
++    rot = calculate_rotation_matrix_to_target(global_coords[9] - global_coords[0], np.array([0, 0, 1]))
++    return (rot @ global_coords.T).T
++
++
++def rotate_based_on_joint_distribution(global_coords):
++    """Rotate about z so the xy projection of joint 0 -> joint 11 lies on +x."""
++    v = global_coords[11, :2] - global_coords[0, :2]
++    a = -np.arctan2(v[1], v[0])
++    rot = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
++    global_coords = global_coords.copy()
++    global_coords[:, :2] = (rot @ global_coords[:, :2].T).T
++    return global_coords
++
++
++# ------------------------------------------------------------------------------
++_URDF_DIR = None
++
++
++def _init(urdf_dir):
++    global _URDF_DIR
++    _URDF_DIR = urdf_dir
++    os.environ.setdefault("OMP_NUM_THREADS", "1")
++
++
++def _build(hand):
++    from dex_retargeting.constants import RobotName, RetargetingType, HandType, get_default_config_path
++    from dex_retargeting.retargeting_config import RetargetingConfig
++    RetargetingConfig.set_default_urdf_dir(str(_URDF_DIR))
++    ht = HandType.left if hand == "left" else HandType.right
++    path = get_default_config_path(RobotName.linker, RetargetingType.vector, ht)
++    return RetargetingConfig.load_from_file(path).build()
++
++
++def _retarget_seq(joints, hand):
++    retargeting = _build(hand)  # fresh low-pass filter state per clip (as upstream)
++    idx = retargeting.optimizer.target_link_human_indices
++    origin_idx, task_idx = idx[0, :], idx[1, :]
++    out = []
++    for frame in joints:
++        tmp = rotate_based_on_joint_distribution(align_09_to_z_axis(frame))
++        out.append(retargeting.retarget(tmp[task_idx, :] - tmp[origin_idx, :]))
++    return np.asarray(out, dtype=np.float32)
++
++
++def _work(job):
++    src, dst = job
++    try:
++        d = np.load(src)
++        left = _retarget_seq(d["left"], "left")
++        right = _retarget_seq(d["right"], "right")
++        np.save(dst, np.concatenate([left, right], axis=1))
++        return None
++    except Exception as e:
++        return f"{src}: {type(e).__name__}: {e}"
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--in_root", required=True, help="out_root of prepare_smplx_poses.py (contains hand_joints/)")
++    ap.add_argument("--out_dir", required=True)
++    ap.add_argument("--urdf_dir", required=True, help="Signbot/body_models/hands")
++    ap.add_argument("--workers", type=int, default=min(8, len(os.sched_getaffinity(0))))
++    ap.add_argument("--overwrite", action="store_true")
++    args = ap.parse_args()
++
++    hand_dir = os.path.join(args.in_root, "hand_joints")
++    os.makedirs(args.out_dir, exist_ok=True)
++    jobs = []
++    for f in sorted(os.listdir(hand_dir)):
++        if not f.endswith(".npz"):
++            continue
++        dst = os.path.join(args.out_dir, f[:-4] + "_hand_full_pose.npy")
++        if os.path.exists(dst) and not args.overwrite:
++            continue
++        jobs.append((os.path.join(hand_dir, f), dst))
++    print(f"{len(jobs)} clips to retarget with {args.workers} workers")
++    if not jobs:
++        return
++
++    try:
++        from tqdm import tqdm
++    except ImportError:
++        def tqdm(x, **k):
++            return x
++
++    errors = []
++    with mp.Pool(args.workers, initializer=_init, initargs=(args.urdf_dir,)) as pool:
++        for err in tqdm(pool.imap_unordered(_work, jobs, chunksize=4), total=len(jobs), desc="hands"):
++            if err:
++                errors.append(err)
++                print("[error]", err)
++    print(f"done, {len(jobs) - len(errors)} ok, {len(errors)} failed")
++    if errors:
++        sys.exit(1)
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+

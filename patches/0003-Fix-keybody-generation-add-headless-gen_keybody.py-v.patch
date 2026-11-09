@@ -1,0 +1,200 @@
+From 0fc92b7f2d54895fe1f9c0e2988013f3bf32e2f8 Mon Sep 17 00:00:00 2001
+From: Signbot AutoDL <zhengsw200304@gmail.com>
+Date: Mon, 9 Nov 2026 07:19:02 +0000
+Subject: [PATCH 3/4] Fix keybody generation; add headless gen_keybody.py;
+ vectorize _set_env_state
+
+- h1_view (H1MimicViewMotion) forced no_keybody=False, so MotionLib exit()ed
+  because the files it is supposed to generate did not exist yet.
+- the *_key_bodies.npy save was commented out (only the W1 dump ran), so the
+  README step never produced the files training needs. Save next to each
+  motion npy (where MotionLib looks); W1 dump is opt-in via SIGNBOT_SAVE_W1=1.
+- gen_keybody.py steps the replay env with zero actions; no dummy policy needed.
+- _set_env_state looped over envs in python on every reset.
+---
+ .../legged_gym/envs/h1/h1_mimic_hand.py       | 18 ++++--
+ .../envs/h1/h1_mimic_view_motion.py           | 34 +++++++----
+ legged_gym/legged_gym/scripts/gen_keybody.py  | 58 +++++++++++++++++++
+ 3 files changed, 95 insertions(+), 15 deletions(-)
+ create mode 100644 legged_gym/legged_gym/scripts/gen_keybody.py
+
+diff --git a/legged_gym/legged_gym/envs/h1/h1_mimic_hand.py b/legged_gym/legged_gym/envs/h1/h1_mimic_hand.py
+index 4885556..2d12c16 100644
+--- a/legged_gym/legged_gym/envs/h1/h1_mimic_hand.py
++++ b/legged_gym/legged_gym/envs/h1/h1_mimic_hand.py
+@@ -631,11 +631,19 @@ class H1MimicHand(LeggedRobotHand):
+         self.root_states[env_ids, 7:10] = root_vel
+         self.root_states[env_ids, 10:13] = root_ang_vel
+ 
+-        for i, env_id in enumerate(env_ids):
+-            self.dof_pos[env_id, self.dof_all_body_pos_index] = dof_pos[i, :]
+-            self.dof_vel[env_id, self.dof_all_body_pos_index] = dof_vel[i, :]
+-            self.dof_pos[env_id, self.dof_hand_pos_index] = hand_dof_pos[i, :]
+-            self.dof_pos[env_id, self.dof_extra_wrist_pos_index] = extra_wrist[i, :]
++        # vectorized version of the upstream per-env python loop (same semantics,
++        # but no O(num_envs) CUDA kernel launches on every reset)
++        if len(env_ids) == 0:
++            return
++        rows = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).view(-1, 1)
++        if not hasattr(self, "_dof_body_idx_t"):
++            self._dof_body_idx_t = torch.as_tensor(self.dof_all_body_pos_index, device=self.device, dtype=torch.long).view(1, -1)
++            self._dof_hand_idx_t = torch.as_tensor(self.dof_hand_pos_index, device=self.device, dtype=torch.long).view(1, -1)
++            self._dof_wrist_idx_t = torch.as_tensor(self.dof_extra_wrist_pos_index, device=self.device, dtype=torch.long).view(1, -1)
++        self.dof_pos[rows, self._dof_body_idx_t] = dof_pos
++        self.dof_vel[rows, self._dof_body_idx_t] = dof_vel
++        self.dof_pos[rows, self._dof_hand_idx_t] = hand_dof_pos
++        self.dof_pos[rows, self._dof_wrist_idx_t] = extra_wrist
+         return
+ 
+     def check_termination(self):
+diff --git a/legged_gym/legged_gym/envs/h1/h1_mimic_view_motion.py b/legged_gym/legged_gym/envs/h1/h1_mimic_view_motion.py
+index d9c3e91..0448027 100644
+--- a/legged_gym/legged_gym/envs/h1/h1_mimic_view_motion.py
++++ b/legged_gym/legged_gym/envs/h1/h1_mimic_view_motion.py
+@@ -6,15 +6,22 @@ from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg
+ from legged_gym.envs.h1.h1_mimic_hand import *
+ from legged_gym.envs.h1.h1_mimic_eval import H1MimicEval
+ import os
++import sys
+ from legged_gym import LEGGED_GYM_ROOT_DIR, ASE_DIR
+ 
+ class H1MimicViewMotion(H1MimicEval):
+     def __init__(self, cfg: LeggedRobotCfg, sim_params, physics_engine, sim_device, headless):
+         self.save = True
++        # also dump W1 (wheeled robot) dof targets; only needed for the cross-embodiment demo
++        self.save_w1 = os.environ.get("SIGNBOT_SAVE_W1", "0") == "1"
+         # cfg.motion.motion_type = "single"
+         # cfg.motion.motion_name = "13_20"  # comes from cmd line arg
+         cfg.motion.num_envs_as_motions = True
+-        cfg.motion.no_keybody = False
++        # This env *generates* the *_key_bodies.npy files, so it must not require them.
++        # Upstream set no_keybody=False, which makes MotionLib exit() with
++        # "No key body positions file found" before anything is generated.
++        cfg.motion.no_keybody = True
++        cfg.motion.regen_pkl = False
+         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
+         # assert only one env and one motion
+         self.motion_frame = torch.zeros_like(self._motion_times, dtype=torch.long, device=self.device)
+@@ -22,8 +29,8 @@ class H1MimicViewMotion(H1MimicEval):
+         self.total_frames = self._motion_lib.get_motion_num_frames(self._motion_ids)
+         self.motor_strength *= 0.0
+ 
+-        self.motion_names = self._motion_lib.get_motion_files(self._motion_ids)
+-        self.motion_names = [name.split("/")[-1].split(".")[0] for name in self.motion_names]
++        self.motion_paths = self._motion_lib.get_motion_files(self._motion_ids)
++        self.motion_names = [os.path.splitext(os.path.basename(name))[0] for name in self.motion_paths]
+         self.to_save_list = []
+         self.w1_dof_pos = []
+         for i in range(self.num_envs):
+@@ -37,22 +44,28 @@ class H1MimicViewMotion(H1MimicEval):
+             # print(f"frame {self.motion_frame.item()}/{self.total_frames}")
+             self._motion_sync()
+             done_percentage = (self.motion_frame.float().sum() / self.total_frames.float().sum()).item()
+-            print(f"done percentage: {done_percentage}")
++            if self.global_counter % 50 == 0:
++                print(f"done percentage: {done_percentage:.3f}")
+             if self.save:
+                 save_ids = torch.where(self.motion_frame == self.total_frames - 1)[0]
+                 if len(save_ids) > 0:
+                     for i in save_ids:
+                         if not self.saved_flags[i]:
+                             assert self.motion_frame[i] == self.to_save_list[i].shape[0] - 1
+-                            # np.save(os.path.join(ASE_DIR, f"ase/poselib/data/retarget_npy/{self.motion_names[i]}_key_bodies.npy"), self.to_save_list[i].cpu().numpy())
+-                            # np.save(f'/data1/guanren/American_poses/target_body/{self.motion_names[i]}_key_bodies.npy', self.to_save_list[i].cpu().numpy())
+-                            np.save(os.path.join(ASE_DIR, f"ase/poselib/data/retarget_npy/{self.motion_names[i]}_w1_dof_pos.npy"), np.array(self.w1_dof_pos))
+-                            print(f"saved {self.motion_names[i]}")
++                            # Upstream had this save commented out (only the W1 dump was active),
++                            # so the keybody files that training needs were never written.
++                            # MotionLib loads os.path.splitext(motion_file)[0] + "_key_bodies.npy".
++                            key_body_file = os.path.splitext(self.motion_paths[i])[0] + "_key_bodies.npy"
++                            np.save(key_body_file, self.to_save_list[i].cpu().numpy())
++                            if self.save_w1:
++                                w1 = np.array(self.w1_dof_pos)[:, i]
++                                np.save(os.path.splitext(self.motion_paths[i])[0] + "_w1_dof_pos.npy", w1)
++                            print(f"saved {key_body_file}")
+                     self.saved_flags[save_ids] = True
+                     
+                 if torch.all(self.saved_flags):
+                     print("all saved")
+-                    exit()
++                    sys.exit(0)
+             self.motion_frame[~self.saved_flags] += 1
+ 
+         return
+@@ -123,7 +136,8 @@ class H1MimicViewMotion(H1MimicEval):
+             for i in range(self.num_envs):
+                 self.to_save_list[i][self.motion_frame[i], :, :] = local_end_pos[i, :]
+         
+-        self.w1_dof_pos.append(torch.cat([dof_pos, hand_dof_pos, extra_wrist, extra_elbow], dim=-1).cpu().numpy())
++        if self.save_w1:
++            self.w1_dof_pos.append(torch.cat([dof_pos, hand_dof_pos, extra_wrist, extra_elbow], dim=-1).cpu().numpy())
+         return
+     
+     def update_demo_obs(self):
+diff --git a/legged_gym/legged_gym/scripts/gen_keybody.py b/legged_gym/legged_gym/scripts/gen_keybody.py
+new file mode 100644
+index 0000000..20f4480
+--- /dev/null
++++ b/legged_gym/legged_gym/scripts/gen_keybody.py
+@@ -0,0 +1,58 @@
++"""Generate <motion>_key_bodies.npy for every motion of a yaml (headless).
++
++Replaces the upstream README step
++    python train.py debug --task h1_view ... --debug   (train 1 iter, kill it)
++    python play.py debug --task h1_view ...
++which needed a dummy checkpoint only to step the env. Here the h1_view env is
++stepped with zero actions: it kinematically replays every motion (one env per
++motion), records local key-body positions and writes
++os.path.splitext(<motion npy>)[0] + "_key_bodies.npy", then exits.
++
++Usage (from legged_gym/legged_gym/scripts):
++    python gen_keybody.py --motion_name motions_how2sign_val.yaml
++"""
++import sys
++
++# get_args() has a required positional `exptid`; it is meaningless here.
++if len(sys.argv) < 2 or sys.argv[1].startswith("-"):
++    sys.argv.insert(1, "gen_keybody")
++
++import isaacgym  # noqa: F401  (must be imported before torch)
++from legged_gym.envs import *  # noqa: F401,F403
++from legged_gym.utils import get_args, task_registry
++import torch
++
++
++def main():
++    args = get_args()
++    args.task = "h1_view"
++    args.headless = True
++    if args.motion_name is not None and args.motion_type is None:
++        args.motion_type = "yaml" if args.motion_name.endswith(".yaml") else "single"
++
++    env_cfg, _ = task_registry.get_cfgs(name=args.task)
++    if args.motion_name is not None:
++        env_cfg.motion.motion_name = args.motion_name
++    if args.motion_type is not None:
++        env_cfg.motion.motion_type = args.motion_type
++    # replay only: no noise / randomization, flat-ish ground
++    env_cfg.noise.add_noise = False
++    env_cfg.domain_rand.push_robots = False
++    env_cfg.domain_rand.randomize_gravity = False
++    env_cfg.terrain.curriculum = False
++    env_cfg.terrain.num_rows = 5
++    env_cfg.terrain.num_cols = 5
++
++    env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
++    print(f"[gen_keybody] replaying {env.num_envs} motions from {env_cfg.motion.motion_name}")
++    actions = torch.zeros(env.num_envs, env.num_actions, device=env.device)
++    max_steps = int(env._motion_lib.get_motion_num_frames(env._motion_ids).max().item()) + 10
++    with torch.no_grad():
++        for _ in range(max_steps):
++            env.step(actions)  # the env calls sys.exit(0) once every motion is saved
++    print("[gen_keybody] finished without saving every motion, check the log above")
++    sys.exit(1)
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+
