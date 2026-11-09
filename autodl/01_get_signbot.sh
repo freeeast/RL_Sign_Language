@@ -5,8 +5,24 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$HERE/.." && pwd)"
 source "$HERE/env.sh"
 
-if [ -d "$SIGNBOT_DIR/.git" ] && [ -n "$(git -C "$SIGNBOT_DIR" log --format=%h --grep='Add path-configurable data pipeline' 2>/dev/null)" ]; then
-    echo "[skip] $SIGNBOT_DIR already patched"
+GIT_ID=(-c user.name=signbot-autodl -c user.email=signbot-autodl@localhost)
+PATCHES=("$REPO_DIR"/patches/*.patch)
+
+# Already set up by an earlier run: only apply patches that are new since then.
+if [ -d "$SIGNBOT_DIR/.git" ] && [ -n "$(git -C "$SIGNBOT_DIR" log --format=%h --grep='strip hardcoded wandb key' 2>/dev/null)" ]; then
+    cd "$SIGNBOT_DIR"
+    applied=$(( $(git rev-list --count "$UPSTREAM_COMMIT"..HEAD) - 1 ))
+    if [ "$applied" -ge "${#PATCHES[@]}" ]; then
+        echo "[skip] $SIGNBOT_DIR already has all ${#PATCHES[@]} patches"
+        exit 0
+    fi
+    if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+        echo "[error] $SIGNBOT_DIR has local modifications; commit or stash them first" >&2
+        exit 1
+    fi
+    echo "[update] applying patches $((applied + 1))..${#PATCHES[@]}"
+    git "${GIT_ID[@]}" am -q "${PATCHES[@]:$applied}"
+    git log --oneline | head -8
     exit 0
 fi
 if [ -e "$SIGNBOT_DIR" ] && [ -n "$(ls -A "$SIGNBOT_DIR" 2>/dev/null)" ]; then
@@ -26,12 +42,11 @@ done
 net_turbo_off
 git -c advice.detachedHead=false checkout -q -B autodl FETCH_HEAD
 
-GIT_ID=(-c user.name=signbot-autodl -c user.email=signbot-autodl@localhost)
 # The upstream train.py hardcodes the author's WANDB_API_KEY. Strip it here (not in
 # a patch) so that this repository never contains the key.
 sed -i "/os.environ\['WANDB_API_KEY'\]/d" legged_gym/legged_gym/scripts/train.py
 git "${GIT_ID[@]}" commit -qam "strip hardcoded wandb key"
-git "${GIT_ID[@]}" am -q "$REPO_DIR"/patches/*.patch
+git "${GIT_ID[@]}" am -q "${PATCHES[@]}"
 
 # SMPL-X model where smplx.create(<Signbot>/body_models, "smplx") looks for it
 mkdir -p body_models/smplx

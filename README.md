@@ -3,7 +3,7 @@
 本仓库不直接拷贝 [qiaoguanren/Signbot](https://github.com/qiaoguanren/Signbot)（约 700MB），而是：
 
 - 固定上游 commit `55087d2`
-- 在上面打 4 个补丁（`patches/`），修掉导致跑不起来的问题
+- 在上面打 5 个补丁（`patches/`），修掉导致跑不起来的问题
 - 提供 AutoDL 一键脚本（`autodl/`），覆盖环境搭建、How2Sign 数据处理到训练的全流程
 
 ```
@@ -16,6 +16,7 @@ autodl/04_data_pipeline.sh       How2Sign SMPL-X → H1 身体 + Linker 手 → 
 autodl/05_train.sh               冒烟测试 / 正式训练
 autodl/check_env.py              环境自检
 tests/                    数据处理部分的离线单元测试
+docs/CODE_GUIDE.md        代码结构、训练流程与算法说明（每个文件的作用、观测/网络/奖励/PPO）
 ```
 
 ---
@@ -35,6 +36,9 @@ tests/                    数据处理部分的离线单元测试
 | 9 | 性能 | `retarget_motion_h1_*.py` | `multiprocessing.cpu_count()` 在容器里返回的是**宿主机**核数（可能上百），会起几十上百个同时 import torch+isaacgym 的进程，导致内存爆掉 | 默认 `min(8, 实际可用核数)`，可用 `--workers` 调整 |
 | 10 | 性能 | `data_process_*.py` | 每个 clip 都重新创建一次 SMPL-X 模型，而且逐帧前向 | 模型只创建一次，在 GPU 上按 clip 批量前向；身体和手部共用同一次前向结果（保证两者帧数一致） |
 | 11 | 性能 | `h1_mimic_hand.py::_set_env_state` | 每次 reset 都用 Python 循环逐个 env 赋值（4096 个 env 就是数千次 CUDA 小 kernel） | 向量化，语义不变（有单测对比） |
+| 13 | 崩溃 | `gen_keybody.py`（第一版） | 策略只输出 **11 维**动作（腿 10 + 躯干 1，`control_actions`），`env.num_actions`=55 是全部 DoF，用 55 维零动作会与动作历史缓冲维度不匹配 | 改用 `control_actions` |
+| 14 | 性能 | `h1_mimic_hand.py::post_physics_step`、`_reset_dofs` | **每一步**都用 Python 循环给 4096 个 env 逐个写入手臂和手指参考角（每步约 1.2 万次 CUDA 小 kernel） | 向量化 |
+| 15 | 性能 | `h1_mimic_hand.py` 奖励函数 | 4 个奖励函数每步 `print` GPU 张量（强制同步，日志暴涨） | 只在 `SIGNBOT_DEBUG_PRINT=1` 时打印 |
 | 12 | 小问题 | `play.py`、`logger.py`、`base_task.py`、`requirements.txt` | `num_envs` 写死成 884；日志路径依赖当前目录；headless 模式下录视频没有图形设备；`requirements.txt` 是 200 行的 `pip freeze`（包含 modelscope、streamlit、ray…，并且是 torch2.4+cu121） | 修正；另给出最小依赖 `autodl/requirements_signbot.txt`，并用 `opencv-python-headless`，服务器上不需要 libGL |
 
 另外两点需要注意：
@@ -48,31 +52,37 @@ tests/                    数据处理部分的离线单元测试
 
 ## 2. AutoDL 部署步骤
 
-### 0) 前提（你已经完成）
+### 0) 前提：你的 `/root/autodl-tmp` 目录
 
 ```
-/root/autodl-tmp/IsaacGym_Preview_4_Package.tar
-/root/autodl-tmp/SMPLX_NEUTRAL.npz   (以及 .pkl，不是必需的)
-/root/autodl-tmp/data/raw_poses/     How2Sign val 的逐帧 SMPL-X pkl（下面有几层子目录都可以，脚本会递归查找）
+/root/autodl-tmp/RL_Sign_Language/          本仓库（git clone）
+/root/autodl-tmp/isaacgym/                  已解压的 Isaac Gym Preview 4（里面有 python/ 子目录）
+/root/autodl-tmp/data/raw_poses/val_poses.zip
+        Neural Sign Actors 作者对 How2Sign 做的 3D 姿态标注（SMPL-X 参数），只有 val。
+        注意：这不是官网的 RGB 视频，本流程也不需要视频
+/root/autodl-tmp/SMPLX_NEUTRAL.npz          SMPL-X 模型。如果放在别处，用 SMPLX_SRC_DIR=/那个目录 指定
 ```
 
-如果 `raw_poses` 里还是压缩包，需要先解压。路径和上面不一样的话，可以改 `autodl/env.sh`，或者用环境变量覆盖，例如 `RAW_POSES=/xxx bash autodl/04_data_pipeline.sh`。
+- `isaacgym/` 已经解压好了，脚本会直接使用，不需要 tar 包。
+- `val_poses.zip` 会被解压到 `data/raw_poses/val_poses/`，内部有几层子目录都可以，脚本会递归查找。脚本会自动识别"每帧一个 pkl"（`<clip>/<clip>_<i>_3D.pkl`）和"每个 clip 一个 pkl"两种格式。
+- 以后上传 `train_poses.zip`、`test_poses.zip` 时，放进同一个目录，并设置 `POSE_ZIPS="val_poses train_poses"`。注意 train 集很大（约 3 万条），数据盘要预留足够空间。
+- 路径和上面不一样的话，可以改 `autodl/env.sh`，或者用环境变量覆盖。
 
-### 1) 拉取本仓库和打好补丁的 Signbot
+### 1) 更新本仓库，拉取打好补丁的 Signbot
 
 ```bash
 source /etc/network_turbo
 ```
 
 ```bash
-cd /root/autodl-tmp && git clone -b claude/cool-cannon-90aot1 https://github.com/freeeast/RL_Sign_Language.git
+cd /root/autodl-tmp/RL_Sign_Language && git fetch origin claude/cool-cannon-90aot1 && git checkout claude/cool-cannon-90aot1 && git pull
 ```
 
 ```bash
-cd /root/autodl-tmp/RL_Sign_Language && bash autodl/01_get_signbot.sh
+bash autodl/01_get_signbot.sh
 ```
 
-完成后得到 `/root/autodl-tmp/Signbot`，它是 `55087d2` 加上 5 个本地 commit。可以用 `git log` / `git diff 55087d2` 查看所有改动。
+完成后得到 `/root/autodl-tmp/Signbot`，它是 `55087d2` 加上 6 个本地 commit。如果之前已经用旧版补丁跑过 01，再跑一次只会补上新增的补丁。可以用 `git log` / `git diff 55087d2` 查看所有改动。
 
 ### 2) 环境（约 10–20 分钟，主要时间花在下载 torch）
 
@@ -90,7 +100,15 @@ bash autodl/03_setup_dexret_env.sh
 
 ### 3) 数据处理
 
-建议先用 50 个 clip 把整条流程跑通：
+先解压并查看数据格式，确认 keys 和 shape 正确：
+
+```bash
+bash autodl/04_data_pipeline.sh inspect
+```
+
+预期能看到 `smplx_root_pose (3,)`、`smplx_body_pose (63,)`、`smplx_lhand_pose (45,)`、`smplx_rhand_pose (45,)`、`smplx_shape (10,)` 等键。如果不是，把输出发给我。
+
+然后用 50 个 clip 把整条流程跑通：
 
 ```bash
 LIMIT=50 bash autodl/04_data_pipeline.sh
@@ -102,11 +120,12 @@ LIMIT=50 bash autodl/04_data_pipeline.sh
 bash autodl/04_data_pipeline.sh
 ```
 
-各步骤可以单独运行：`prepare | yaml | body | hands | finalize | keybody`。
+各步骤可以单独运行：`unzip | inspect | prepare | yaml | body | hands | finalize | keybody`。
 
 | 步骤 | 环境 | 输入 → 输出（都在 `/root/autodl-tmp/data/how2sign/` 下） |
 |---|---|---|
-| prepare | signbot | `raw_poses` → `source_body/*.npy`、`hand_joints/*.npz`、`index.csv` |
+| unzip / inspect | signbot | `val_poses.zip` → `raw_poses/val_poses/`，并打印数据结构 |
+| prepare | signbot | `raw_poses/val_poses` → `source_body/*.npy`、`hand_joints/*.npz`、`index.csv` |
 | yaml | signbot | → `Signbot/ASE/ase/poselib/data/configs/motions_how2sign_val.yaml` |
 | body | signbot | `source_body` → `target_body/*.npy`（H1） |
 | hands | dexret | `hand_joints` → `target_linker_hand/*_hand_full_pose.npy` |

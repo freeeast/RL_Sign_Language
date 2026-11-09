@@ -1,0 +1,318 @@
+From 7af7cbc6239ea8b4a9a0fcd7f04c2c43a60311da Mon Sep 17 00:00:00 2001
+From: Signbot AutoDL <zhengsw200304@gmail.com>
+Date: Mon, 9 Nov 2026 08:33:03 +0000
+Subject: [PATCH 5/5] Fix gen_keybody action size; vectorize per-step dof
+ loops; drop per-step prints; per-clip pose layout
+
+- gen_keybody.py stepped the env with env.num_actions (55) zeros, but the policy
+  and the action history buffer use cfg.env.control_actions (11: legs + torso).
+- post_physics_step wrote arm/wrist/finger reference angles with a python loop
+  over all envs on every step; _reset_dofs looped too. Vectorized.
+- reward functions printed GPU tensors every step (sync + log spam); now only
+  with SIGNBOT_DEBUG_PRINT=1.
+- prepare_smplx_poses.py: auto-detect one-pkl-per-frame vs one-pkl-per-clip
+  layouts; --inspect prints layout/keys/shapes without processing.
+---
+ .../legged_gym/envs/h1/h1_mimic_hand.py       |  44 +++++---
+ legged_gym/legged_gym/scripts/gen_keybody.py  |   5 +-
+ tools/prepare_smplx_poses.py                  | 105 +++++++++++++++---
+ 3 files changed, 122 insertions(+), 32 deletions(-)
+
+diff --git a/legged_gym/legged_gym/envs/h1/h1_mimic_hand.py b/legged_gym/legged_gym/envs/h1/h1_mimic_hand.py
+index 2d12c16..7a4ed96 100644
+--- a/legged_gym/legged_gym/envs/h1/h1_mimic_hand.py
++++ b/legged_gym/legged_gym/envs/h1/h1_mimic_hand.py
+@@ -25,6 +25,8 @@ import cv2
+ from motion_lib import MotionLib
+ import torch_utils
+ 
++_DEBUG_PRINT = os.environ.get("SIGNBOT_DEBUG_PRINT", "0") == "1"
++
+ class H1MimicHand(LeggedRobotHand):
+     def __init__(self, cfg: LeggedRobotCfg, sim_params, physics_engine, sim_device, headless):
+         # Simon: to save the obs demo when inferring
+@@ -383,10 +385,11 @@ class H1MimicHand(LeggedRobotHand):
+     def _reset_dofs(self, env_ids, dof_pos, dof_vel, hand_dof_pos):
+ 
+         # dof_pos_default = self.default_dof_pos + torch_rand_float(-0.2, 0.2, (len(env_ids), self.num_dof), device=self.device) * self.default_dof_pos
+-        for i, env_id in enumerate(env_ids):
+-            self.dof_pos[env_id, self.dof_all_body_pos_index] = dof_pos[i, :]
+-            self.dof_vel[env_id, self.dof_all_body_pos_index] = dof_vel[i, :]
+-            self.dof_pos[env_id, self.dof_hand_pos_index] = hand_dof_pos[i, :]
++        self._init_dof_index_tensors()
++        rows = env_ids.long().view(-1, 1)  # vectorized (upstream: python loop over envs)
++        self.dof_pos[rows, self._dof_body_idx_t] = dof_pos
++        self.dof_vel[rows, self._dof_body_idx_t] = dof_vel
++        self.dof_pos[rows, self._dof_hand_idx_t] = hand_dof_pos
+ 
+         # self.dof_pos[env_ids] = self.default_dof_pos + torch_rand_float(0., 0.5, (len(env_ids), self.num_dof), device=self.device)
+         # self.dof_vel[env_ids] = 0.
+@@ -416,10 +419,12 @@ class H1MimicHand(LeggedRobotHand):
+         env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
+         dof_pos, dof_vel = self.reindex_dof_pos_vel(dof_pos, dof_vel)
+ 
+-        for i, env_id in enumerate(env_ids):
+-            self.dof_pos[env_id, self.dof_hand_pos_index] = hand_dof_pos[i, :]
+-            self.dof_pos[env_id, self.dof_all_body_pos_index[11:]] = dof_pos[i, 11:]
+-            self.dof_pos[env_id, self.dof_extra_wrist_pos_index] = extra_wrist[i, :]             
++        # upper body (arms, wrists, fingers) is set kinematically from the reference motion;
++        # vectorized version of the upstream per-env python loop (ran every step)
++        self._init_dof_index_tensors()
++        self.dof_pos[:, self._dof_hand_idx_t[0]] = hand_dof_pos
++        self.dof_pos[:, self._dof_body_idx_t[0, 11:]] = dof_pos[:, 11:]
++        self.dof_pos[:, self._dof_wrist_idx_t[0]] = extra_wrist
+             # self.dof_vel[env_id, self.dof_all_body_pos_index[11:]] = dof_vel[i, 11:]
+ 
+         env_ids_int32 = env_ids.to(dtype=torch.int32)
+@@ -625,6 +630,12 @@ class H1MimicHand(LeggedRobotHand):
+                                               gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+         return
+     
++    def _init_dof_index_tensors(self):
++        if not hasattr(self, "_dof_body_idx_t"):
++            self._dof_body_idx_t = torch.as_tensor(self.dof_all_body_pos_index, device=self.device, dtype=torch.long).view(1, -1)
++            self._dof_hand_idx_t = torch.as_tensor(self.dof_hand_pos_index, device=self.device, dtype=torch.long).view(1, -1)
++            self._dof_wrist_idx_t = torch.as_tensor(self.dof_extra_wrist_pos_index, device=self.device, dtype=torch.long).view(1, -1)
++
+     def _set_env_state(self, env_ids, root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel, hand_dof_pos, extra_wrist):
+         self.root_states[env_ids, 0:3] = root_pos
+         self.root_states[env_ids, 3:7] = root_rot
+@@ -636,10 +647,7 @@ class H1MimicHand(LeggedRobotHand):
+         if len(env_ids) == 0:
+             return
+         rows = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).view(-1, 1)
+-        if not hasattr(self, "_dof_body_idx_t"):
+-            self._dof_body_idx_t = torch.as_tensor(self.dof_all_body_pos_index, device=self.device, dtype=torch.long).view(1, -1)
+-            self._dof_hand_idx_t = torch.as_tensor(self.dof_hand_pos_index, device=self.device, dtype=torch.long).view(1, -1)
+-            self._dof_wrist_idx_t = torch.as_tensor(self.dof_extra_wrist_pos_index, device=self.device, dtype=torch.long).view(1, -1)
++        self._init_dof_index_tensors()
+         self.dof_pos[rows, self._dof_body_idx_t] = dof_pos
+         self.dof_vel[rows, self._dof_body_idx_t] = dof_vel
+         self.dof_pos[rows, self._dof_hand_idx_t] = hand_dof_pos
+@@ -801,7 +809,8 @@ class H1MimicHand(LeggedRobotHand):
+     def _reward_tracking_demo_yaw(self):
+         rew = torch.exp(-torch.abs(self.target_yaw - self.yaw))
+         # print("yaw rew", rew, self.target_yaw, self.yaw)
+-        print("yaw", torch.mean(torch.abs(self.target_yaw - self.yaw),dim=0))
++        if _DEBUG_PRINT:  # upstream printed every step (GPU->CPU sync + log spam)
++            print("yaw", torch.mean(torch.abs(self.target_yaw - self.yaw),dim=0))
+         return rew
+ 
+     def _reward_dof_pos_limits(self):
+@@ -831,7 +840,8 @@ class H1MimicHand(LeggedRobotHand):
+         # print(rew[self.lookat_id].cpu().numpy())
+         # print("dof_pos", dof_pos)
+         # print("demo_dofs", demo_dofs)
+-        print("dof_pos_tracking", torch.mean(torch.norm((dof_pos - demo_dofs), dim =-1), dim=0))
++        if _DEBUG_PRINT:  # upstream printed every step (GPU->CPU sync + log spam)
++            print("dof_pos_tracking", torch.mean(torch.norm((dof_pos - demo_dofs), dim =-1), dim=0))
+         return rew
+     
+     def _reward_tracking_demo_hand_dof_pos(self):
+@@ -856,7 +866,8 @@ class H1MimicHand(LeggedRobotHand):
+         demo_vel = self._curr_demo_obs_buf[:, self._n_demo_dof:self._n_demo_dof+3]
+         demo_vel[self._in_place_flag] = 0
+         rew = torch.exp(- 4 * torch.norm(self.base_lin_vel - demo_vel, dim=1))
+-        print("lin_vel", torch.mean(torch.norm(self.base_lin_vel - demo_vel, dim=1),dim=0))
++        if _DEBUG_PRINT:  # upstream printed every step (GPU->CPU sync + log spam)
++            print("lin_vel", torch.mean(torch.norm(self.base_lin_vel - demo_vel, dim=1),dim=0))
+         return rew
+ 
+     def _reward_tracking_demo_ang_vel(self):
+@@ -868,7 +879,8 @@ class H1MimicHand(LeggedRobotHand):
+         demo_roll_pitch = self._curr_demo_obs_buf[:, self._n_demo_dof+6:self._n_demo_dof+8]
+         cur_roll_pitch = torch.stack((self.roll, self.pitch), dim=1)
+         rew = torch.exp(-torch.norm(cur_roll_pitch - demo_roll_pitch, dim=1))
+-        print("roll_pitch", torch.mean(torch.norm(cur_roll_pitch - demo_roll_pitch, dim=1),dim=0))
++        if _DEBUG_PRINT:  # upstream printed every step (GPU->CPU sync + log spam)
++            print("roll_pitch", torch.mean(torch.norm(cur_roll_pitch - demo_roll_pitch, dim=1),dim=0))
+         return rew
+     
+     def _reward_tracking_demo_height(self):
+diff --git a/legged_gym/legged_gym/scripts/gen_keybody.py b/legged_gym/legged_gym/scripts/gen_keybody.py
+index 20f4480..fc62cdf 100644
+--- a/legged_gym/legged_gym/scripts/gen_keybody.py
++++ b/legged_gym/legged_gym/scripts/gen_keybody.py
+@@ -45,7 +45,10 @@ def main():
+ 
+     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
+     print(f"[gen_keybody] replaying {env.num_envs} motions from {env_cfg.motion.motion_name}")
+-    actions = torch.zeros(env.num_envs, env.num_actions, device=env.device)
++    # the policy only drives legs + torso: cfg.env.control_actions (=11), env.num_actions (=55)
++    # is the full dof count and would not match the action history buffer
++    n_act = getattr(env.cfg.env, "control_actions", env.num_actions)
++    actions = torch.zeros(env.num_envs, n_act, device=env.device)
+     max_steps = int(env._motion_lib.get_motion_num_frames(env._motion_ids).max().item()) + 10
+     with torch.no_grad():
+         for _ in range(max_steps):
+diff --git a/tools/prepare_smplx_poses.py b/tools/prepare_smplx_poses.py
+index a9f6fca..063dcbc 100644
+--- a/tools/prepare_smplx_poses.py
++++ b/tools/prepare_smplx_poses.py
+@@ -74,12 +74,59 @@ def frame_index(fname, clip):
+     return int(nums[-1])
+ 
+ 
+-def find_clip_dirs(pose_root):
++def _load_pkl(path):
++    with open(path, "rb") as fh:
++        return pickle.load(fh)
++
++
++def _num_frames_in(d):
++    """1 for a per-frame record, T for a per-clip record (arrays stacked over time)."""
++    v = np.asarray(d["smplx_body_pose"])
++    return max(1, v.size // 63)
++
++
++def find_clips(pose_root):
++    """Return [(clip_name, path, layout)], layout in {"frames", "clip"}.
++
++    "frames": a directory with one pkl per frame (SOKE / Neural Sign Actors How2Sign:
++              <clip>/<clip>_<i>_3D.pkl)
++    "clip"  : one pkl per clip with arrays of shape (T, ...)
++    Detected per directory by looking at one pkl.
++    """
+     clips = []
+     for dirpath, _, filenames in os.walk(pose_root, followlinks=True):
+-        if any(f.endswith(".pkl") for f in filenames):
+-            clips.append(dirpath)
+-    return sorted(clips)
++        pkls = sorted(f for f in filenames if f.endswith(".pkl"))
++        if not pkls:
++            continue
++        if _num_frames_in(_load_pkl(os.path.join(dirpath, pkls[0]))) > 1:
++            clips += [(os.path.splitext(f)[0], os.path.join(dirpath, f), "clip") for f in pkls]
++        else:
++            clips.append((os.path.basename(os.path.normpath(dirpath)), dirpath, "frames"))
++    return sorted(clips, key=lambda c: c[1])
++
++
++def find_clip_dirs(pose_root):
++    return [path for _, path, layout in find_clips(pose_root) if layout == "frames"]
++
++
++def inspect(pose_root, n=3):
++    """Print what the pose data looks like (layout, keys, shapes), no processing."""
++    clips = find_clips(pose_root)
++    layouts = {}
++    for _, _, l in clips:
++        layouts[l] = layouts.get(l, 0) + 1
++    print(f"{len(clips)} clips under {pose_root}: {layouts}")
++    for name, path, layout in clips[:n]:
++        if layout == "frames":
++            files = sorted((f for f in os.listdir(path) if f.endswith(".pkl")), key=lambda f: frame_index(f, name))
++            print(f"- {name}  [{layout}] {len(files)} frames: {files[0]} ... {files[-1]}")
++            d = _load_pkl(os.path.join(path, files[0]))
++        else:
++            d = _load_pkl(path)
++            print(f"- {name}  [{layout}] {path}")
++        for k, v in d.items():
++            a = np.asarray(v) if not isinstance(v, (str, bytes)) else v
++            print(f"    {k}: {getattr(a, 'shape', type(v).__name__)} {getattr(a, 'dtype', '')}")
+ 
+ 
+ def _vec(data, key, n, required=True):
+@@ -93,6 +140,28 @@ def _vec(data, key, n, required=True):
+     return v[:n]
+ 
+ 
++def load_clip_file(path):
++    """One pkl containing a whole clip (arrays of shape (T, ...))."""
++    clip = os.path.splitext(os.path.basename(path))[0]
++    d = _load_pkl(path)
++    T = _num_frames_in(d)
++
++    def arr(key, n, required=True):
++        if key not in d:
++            if required:
++                raise KeyError(key)
++            return np.zeros((T, n), dtype=np.float32)
++        a = np.asarray(d[key], dtype=np.float32).reshape(T, -1)
++        if a.shape[1] < n:
++            raise ValueError(f"{key} has shape {a.shape}, expected (T, {n})")
++        return a[:, :n]
++    betas = arr("smplx_shape", 10) if np.asarray(d["smplx_shape"]).size >= 10 * T \
++        else np.repeat(np.asarray(d["smplx_shape"], np.float32).reshape(1, -1)[:, :10], T, 0)
++    return clip, {"root": arr("smplx_root_pose", 3), "body": arr("smplx_body_pose", 63),
++                  "lhand": arr("smplx_lhand_pose", 45), "rhand": arr("smplx_rhand_pose", 45),
++                  "transl": arr("cam_trans", 3, required=False), "betas": betas}, 0
++
++
+ def load_clip(clip_dir):
+     clip = os.path.basename(os.path.normpath(clip_dir))
+     files = [f for f in os.listdir(clip_dir) if f.endswith(".pkl")]
+@@ -222,16 +291,23 @@ def hand_joints(joints):
+ def main():
+     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+     ap.add_argument("--pose_root", required=True, help="dir that contains one sub-dir of *.pkl frames per clip (searched recursively)")
+-    ap.add_argument("--smplx_dir", required=True, help="dir containing smplx/SMPLX_NEUTRAL.npz (smplx.create model_path)")
+-    ap.add_argument("--out_root", required=True)
++    ap.add_argument("--smplx_dir", default=None, help="dir containing smplx/SMPLX_NEUTRAL.npz (smplx.create model_path)")
++    ap.add_argument("--out_root", default=None)
+     ap.add_argument("--fps", type=float, default=30.0, help="fps written into the motion (upstream: 30)")
+     ap.add_argument("--min_frames", type=int, default=10, help="skip clips shorter than this (upstream: 10)")
+     ap.add_argument("--template", default=None, help="optional processed source_body .npy used for the frozen lower body")
+     ap.add_argument("--device", default="cuda")
+     ap.add_argument("--limit", type=int, default=0, help="only process the first N clips (debug)")
+     ap.add_argument("--overwrite", action="store_true")
++    ap.add_argument("--inspect", action="store_true", help="only print the data layout / keys / shapes and exit")
+     args = ap.parse_args()
+ 
++    if args.inspect:
++        inspect(args.pose_root)
++        return
++    if not args.smplx_dir or not args.out_root:
++        ap.error("--smplx_dir and --out_root are required (unless --inspect)")
++
+     import torch
+     import smplx
+ 
+@@ -245,12 +321,12 @@ def main():
+                          flat_hand_mean=False, use_pca=False, batch_size=1).to(device)
+     template = load_template(args.template) if args.template else canonical_template()
+ 
+-    clip_dirs = find_clip_dirs(args.pose_root)
++    clips = find_clips(args.pose_root)
+     if args.limit > 0:
+-        clip_dirs = clip_dirs[:args.limit]
+-    print(f"found {len(clip_dirs)} clip dirs under {args.pose_root}")
+-    if not clip_dirs:
+-        sys.exit("no *.pkl found, check --pose_root")
++        clips = clips[:args.limit]
++    print(f"found {len(clips)} clips under {args.pose_root}")
++    if not clips:
++        sys.exit("no *.pkl found, check --pose_root (is the zip extracted?)")
+ 
+     index_path = os.path.join(args.out_root, "index.csv")
+     index = {}
+@@ -266,15 +342,14 @@ def main():
+             return x
+ 
+     n_ok = n_skip = n_fail = 0
+-    for clip_dir in tqdm(clip_dirs, desc="smplx"):
+-        clip = os.path.basename(os.path.normpath(clip_dir))
++    for clip, clip_path, layout in tqdm(clips, desc="smplx"):
+         body_file = os.path.join(body_dir, clip + ".npy")
+         hand_file = os.path.join(hand_dir, clip + ".npz")
+         if not args.overwrite and os.path.exists(body_file) and os.path.exists(hand_file) and clip in index:
+             n_skip += 1
+             continue
+         try:
+-            clip, p, gaps = load_clip(clip_dir)
++            clip, p, gaps = load_clip(clip_path) if layout == "frames" else load_clip_file(clip_path)
+             T = p["body"].shape[0]
+             if T < args.min_frames:
+                 n_skip += 1
+@@ -291,7 +366,7 @@ def main():
+             n_ok += 1
+         except Exception as e:  # keep going, report at the end
+             n_fail += 1
+-            print(f"[error] {clip_dir}: {type(e).__name__}: {e}")
++            print(f"[error] {clip_path}: {type(e).__name__}: {e}")
+ 
+     with open(index_path, "w", newline="") as f:
+         w = csv.writer(f)
+-- 
+2.43.0
+

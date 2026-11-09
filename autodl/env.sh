@@ -3,9 +3,10 @@
 : "${AUTODL_TMP:=/root/autodl-tmp}"
 
 # inputs you uploaded
-: "${ISAACGYM_TAR:=$AUTODL_TMP/IsaacGym_Preview_4_Package.tar}"
+: "${ISAACGYM_TAR:=$AUTODL_TMP/IsaacGym_Preview_4_Package.tar}"   # only used if $ISAACGYM_DIR is missing
 : "${SMPLX_SRC_DIR:=$AUTODL_TMP}"                 # contains SMPLX_NEUTRAL.npz (and/or .pkl)
-: "${RAW_POSES:=$AUTODL_TMP/data/raw_poses}"      # How2Sign SMPL-X per-frame pkl (any depth)
+: "${RAW_POSES:=$AUTODL_TMP/data/raw_poses}"      # holds val_poses.zip (Neural Sign Actors How2Sign 3D poses)
+: "${POSE_ZIPS:=val_poses}"                       # zips to extract/use, space separated: "val_poses train_poses"
 
 # outputs / code
 : "${ISAACGYM_DIR:=$AUTODL_TMP/isaacgym}"
@@ -27,7 +28,7 @@
 export PIP_CACHE_DIR="$AUTODL_TMP/.cache/pip"
 export CONDA_PKGS_DIRS="$AUTODL_TMP/.cache/conda_pkgs"
 
-export AUTODL_TMP ISAACGYM_TAR SMPLX_SRC_DIR RAW_POSES ISAACGYM_DIR SIGNBOT_DIR DATA_ROOT \
+export AUTODL_TMP ISAACGYM_TAR SMPLX_SRC_DIR RAW_POSES POSE_ZIPS ISAACGYM_DIR SIGNBOT_DIR DATA_ROOT \
        MOTION_YAML DEBUG_YAML MIN_FRAMES CONDA_ENV DEX_ENV SIGNBOT_URL UPSTREAM_COMMIT
 
 conda_activate() {

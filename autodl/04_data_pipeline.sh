@@ -2,7 +2,8 @@
 # How2Sign SMPL-X poses -> retargeted H1 + Linker-hand motions + key bodies.
 #
 #   bash autodl/04_data_pipeline.sh            # all steps
-#   bash autodl/04_data_pipeline.sh prepare    # a single step (prepare|yaml|body|hands|finalize|keybody)
+#   bash autodl/04_data_pipeline.sh inspect    # unzip + print pose layout/keys (run this first)
+#   bash autodl/04_data_pipeline.sh prepare    # a single step (unzip|inspect|prepare|yaml|body|hands|finalize|keybody)
 #   LIMIT=50 bash autodl/04_data_pipeline.sh   # only the first 50 clips (quick end-to-end test)
 #
 # Every step skips clips that are already done, so it is safe to re-run.
@@ -13,11 +14,39 @@ STEP="${1:-all}"
 : "${WORKERS:=12}"   # 16 vCPU on the AutoDL instance
 : "${LIMIT:=0}"
 
-step_prepare() {   # [signbot env] SMPL-X forward pass -> source_body/ hand_joints/ index.csv
+step_unzip() {     # $RAW_POSES/<name>.zip -> $RAW_POSES/<name>/
+    local name z dst
+    for name in $POSE_ZIPS; do
+        z="$RAW_POSES/$name.zip"; dst="$RAW_POSES/$name"
+        if [ -f "$dst/.unzipped" ]; then echo "[skip] $dst already extracted"; continue; fi
+        [ -f "$z" ] || { echo "[error] $z not found" >&2; exit 1; }
+        echo "extracting $z -> $dst"
+        mkdir -p "$dst"
+        if command -v unzip >/dev/null; then unzip -q -o "$z" -d "$dst"; else python3 -m zipfile -e "$z" "$dst"; fi
+        touch "$dst/.unzipped"
+    done
+    df -h "$RAW_POSES" | tail -1
+}
+
+step_inspect() {   # [signbot env] show layout / keys / shapes of the pose files, no processing
+    step_unzip
     conda_activate "$CONDA_ENV"
     cd "$SIGNBOT_DIR"
-    python tools/prepare_smplx_poses.py --pose_root "$RAW_POSES" --smplx_dir "$SIGNBOT_DIR/body_models" \
-        --out_root "$DATA_ROOT" --min_frames "$MIN_FRAMES" --limit "$LIMIT"
+    local name
+    for name in $POSE_ZIPS; do
+        python tools/prepare_smplx_poses.py --pose_root "$RAW_POSES/$name" --inspect
+    done
+}
+
+step_prepare() {   # [signbot env] SMPL-X forward pass -> source_body/ hand_joints/ index.csv
+    step_unzip
+    conda_activate "$CONDA_ENV"
+    cd "$SIGNBOT_DIR"
+    local name
+    for name in $POSE_ZIPS; do
+        python tools/prepare_smplx_poses.py --pose_root "$RAW_POSES/$name" --smplx_dir "$SIGNBOT_DIR/body_models" \
+            --out_root "$DATA_ROOT" --min_frames "$MIN_FRAMES" --limit "$LIMIT"
+    done
 }
 
 step_yaml() {      # [signbot env] motion list used by the body retargeting
@@ -64,6 +93,8 @@ step_keybody() {   # [signbot env, GPU] replay motions in Isaac Gym -> <clip>_ke
 
 case "$STEP" in
     all)      step_prepare; step_yaml; step_body; step_hands; step_finalize; step_keybody ;;
+    unzip)    step_unzip ;;
+    inspect)  step_inspect ;;
     prepare)  step_prepare ;;
     yaml)     step_yaml ;;
     body)     step_body ;;

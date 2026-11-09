@@ -1,7 +1,7 @@
 From 2977d14ce19d5ba71742f32084570b207de5148e Mon Sep 17 00:00:00 2001
 From: Signbot AutoDL <zhengsw200304@gmail.com>
 Date: Mon, 9 Nov 2026 07:22:48 +0000
-Subject: [PATCH 4/4] Add path-configurable data pipeline for How2Sign/SOKE
+Subject: [PATCH 4/5] Add path-configurable data pipeline for How2Sign/SOKE
  SMPL-X poses
 
 tools/prepare_smplx_poses.py   SMPL-X pkl -> source_body/*.npy + hand_joints/*.npz

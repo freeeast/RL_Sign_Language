@@ -92,7 +92,10 @@ def main():
             if pk:
                 clips += 1
                 first = first or os.path.join(dirpath, pk[0])
-        assert clips, f"no *.pkl under {args.raw_poses} (archive not extracted?)"
+        if not clips:
+            zips = [f for f in os.listdir(args.raw_poses) if f.endswith(".zip")] if os.path.isdir(args.raw_poses) else []
+            assert zips, f"no *.pkl and no *.zip under {args.raw_poses}"
+            return f"only {zips} (not extracted yet) -> run: bash autodl/04_data_pipeline.sh inspect"
         with open(first, "rb") as f:
             d = pickle.load(f)
         keys = sorted(d.keys()) if isinstance(d, dict) else type(d).__name__

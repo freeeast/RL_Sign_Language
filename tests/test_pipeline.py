@@ -31,7 +31,19 @@ with tempfile.TemporaryDirectory() as d:
     assert c == clip and gaps == 0 and p["body"].shape == (T, 63)
     assert np.all(p["body"][:, 0] == np.arange(T)), "frames not in numeric order"
     assert np.all(p["transl"] == 0)  # cam_trans missing -> zeros
-print("load_clip ok")
+    # same data stored as one pkl per clip (T, ...) must give identical arrays
+    cf = os.path.join(d, "clips"); os.makedirs(cf)
+    rec = {"smplx_root_pose": p["root"], "smplx_body_pose": p["body"], "smplx_lhand_pose": p["lhand"],
+           "smplx_rhand_pose": p["rhand"], "smplx_shape": p["betas"][0]}
+    with open(os.path.join(cf, "clipA.pkl"), "wb") as f: pickle.dump(rec, f)
+    found = P.find_clips(d)
+    assert ("clipA", os.path.join(cf, "clipA.pkl"), "clip") in found and (clip, cd, "frames") in found, found
+    c2, p2, _ = P.load_clip_file(os.path.join(cf, "clipA.pkl"))
+    for k in ("root", "body", "lhand", "rhand"):
+        assert np.allclose(p2[k], p[k]), k
+    assert p2["betas"].shape == (T, 10) and np.all(p2["transl"] == 0)
+    P.inspect(d)
+print("load_clip ok (per-frame and per-clip layouts)")
 
 # 3. build_motion vs upstream loop math (fake smplx joints)
 T = 25

@@ -1,7 +1,7 @@
 From e0ae0d8048c52b37e7635c5642fec2222b4e1510 Mon Sep 17 00:00:00 2001
 From: Signbot AutoDL <zhengsw200304@gmail.com>
 Date: Mon, 9 Nov 2026 07:17:42 +0000
-Subject: [PATCH 2/4] MotionLib: configurable hand dir, hand/body frame check,
+Subject: [PATCH 2/5] MotionLib: configurable hand dir, hand/body frame check,
  lerp hand angles, fix pkl cache
 
 - hand poses were loaded from a hardcoded /data1/guanren/CSL-Daily path; now from
